@@ -1,0 +1,49 @@
+<svg
+  width="512"
+  height="512"
+  viewBox="0 35 512 570"
+  xmlns="http://www.w3.org/2000/svg"
+  fill="none"
+>
+
+  <!-- Concentric signal rings (smaller) -->
+  <circle cx="256" cy="220" r="165" fill="#1E4E8C"/>
+  <circle cx="256" cy="220" r="140" fill="#1F6FAE"/>
+  <circle cx="256" cy="220" r="115" fill="#2798C4"/>
+  <circle cx="256" cy="220" r="90"  fill="#34B1CE"/>
+  <circle cx="256" cy="220" r="65"  fill="#57C6D9"/>
+
+  <!-- Center dot -->
+  <circle cx="256" cy="220" r="14" fill="#1E4E8C"/>
+
+  <!-- Main legs (longer but inside canvas) -->
+  <path
+    d="M256 280 L115 592"
+    stroke="#57C6D9"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+
+  <path
+    d="M256 280 L407 592"
+    stroke="#57C6D9"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+
+  <!-- Crossing support legs -->
+  <path
+    d="M175 468 L304 380"
+    stroke="#57C6D9"
+    stroke-width="26"
+    stroke-linecap="round"
+  />
+
+  <path
+    d="M304 380 L230 350"
+    stroke="#57C6D9"
+    stroke-width="26"
+    stroke-linecap="round"
+  />
+
+</svg>

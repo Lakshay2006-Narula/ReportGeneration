@@ -1,0 +1,34 @@
+{
+  "name": "stracer-report-generator",
+  "version": "2.0.1",
+  "private": true,
+  "description": "Indoor Report desktop generator built with Next.js and Tauri.",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "backend:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\start-backend-dev.ps1",
+    "web:dev": "concurrently -k \"npm run dev\" \"npm run backend:dev\"",
+    "tauri:dev": "tauri dev",
+    "desktop:dev": "npm run tauri:dev",
+    "build": "next build",
+    "build:backend": "dotnet publish backend\\SignalTracker.Api\\SignalTracker.Api.csproj -c Release -r win-x64 --self-contained true -o backend-publish /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true",
+    "dist": "npm run build:backend && tauri build",
+    "dist:dir": "npm run build:backend && tauri build --bundles nsis",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-fs": "^2.5.2",
+    "lucide-react": "^1.33.0",
+    "next": "^15.5.7",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "autoprefixer": "^10.5.4",
+    "concurrently": "^9.2.1",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^3.4.17",
+    "wait-on": "^9.0.1"
+  }
+}

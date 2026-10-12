@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Indoor Report">
+  <defs>
+    <linearGradient id="tile" x1="36" y1="28" x2="224" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="0.52" stop-color="#0284c7"/>
+      <stop offset="1" stop-color="#194c9f"/>
+    </linearGradient>
+    <linearGradient id="line" x1="68" y1="65" x2="188" y2="191" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dffafe"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="54" fill="url(#tile)"/>
+  <path d="M72 79h112v98H72z" fill="none" stroke="url(#line)" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M128 79v98M72 128h112" fill="none" stroke="url(#line)" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="128" cy="128" r="17" fill="#ffffff"/>
+  <path d="M94 58h68M94 198h68" fill="none" stroke="#9deff8" stroke-width="10" stroke-linecap="round" opacity=".86"/>
+</svg>

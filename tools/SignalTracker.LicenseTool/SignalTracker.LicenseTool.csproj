@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>STracerLicenseGenerator</AssemblyName>
+    <ApplicationIcon>..\..\build\icon.ico</ApplicationIcon>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('..\..\license-keys\private-key.txt')">
+    <EmbeddedResource Include="..\..\license-keys\private-key.txt" LogicalName="private-key.txt" />
+  </ItemGroup>
+</Project>

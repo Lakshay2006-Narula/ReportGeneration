@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Next.js output
+.next/
+out/
+
+# Tauri / Rust output
+src-tauri/target/
+target/
+
+# .NET output
+**/bin/
+**/obj/
+backend-publish/
+
+# Generated build artifacts
+dist/
+build/
+.verify-build/
+*.exe
+*.msi
+*.pdb
+*.zip
+*.nupkg
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env/config
+.env
+.env.*
+!.env.example
+backend-data/
+
+# Licensing secrets
+license-keys/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
