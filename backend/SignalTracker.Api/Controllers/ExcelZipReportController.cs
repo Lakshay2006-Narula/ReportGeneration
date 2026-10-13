@@ -9,8 +9,11 @@ namespace SignalTracker.Controllers
     [ApiController]
     public class ExcelZipReportController : ExcelReportController
     {
-        public ExcelZipReportController(ApplicationDbContext db, IHttpClientFactory httpClientFactory)
-            : base(db, httpClientFactory)
+        public ExcelZipReportController(
+            ApplicationDbContext db,
+            IHttpClientFactory httpClientFactory,
+            IConfiguration configuration)
+            : base(db, httpClientFactory, configuration)
         {
         }
     }

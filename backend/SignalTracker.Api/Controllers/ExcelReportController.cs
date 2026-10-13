@@ -92,11 +92,16 @@ namespace SignalTracker.Controllers
 
         private readonly ApplicationDbContext _db;
         private readonly IHttpClientFactory _httpClientFactory;
+        private readonly IConfiguration _configuration;
 
-        public ExcelReportController(ApplicationDbContext db, IHttpClientFactory httpClientFactory)
+        public ExcelReportController(
+            ApplicationDbContext db,
+            IHttpClientFactory httpClientFactory,
+            IConfiguration configuration)
         {
             _db = db;
             _httpClientFactory = httpClientFactory;
+            _configuration = configuration;
         }
 
 
@@ -463,6 +468,254 @@ namespace SignalTracker.Controllers
                 ProgressStreamUrl = $"/api/ExcelReport/ProgressStream/{jobId}",
                 DownloadUrl = $"/api/ExcelReport/Download/{jobId}"
             });
+        }
+
+        // POST api/ExcelReport/StartGenerateFromRemoteLogs
+        // Downloads the selected remote ZIPs and feeds them into the same asynchronous
+        // report pipeline used by StartGenerateFromZip.
+        [HttpPost("StartGenerateFromRemoteLogs")]
+        [Microsoft.AspNetCore.RateLimiting.EnableRateLimiting("Report")]
+        [Consumes("application/json")]
+        public IActionResult StartGenerateFromRemoteLogs([FromBody] RemoteLogReportRequest request)
+        {
+            var logIds = request?.LogIds?
+                .Where(id => id > 0)
+                .Distinct()
+                .ToList() ?? new List<long>();
+
+            if (logIds.Count == 0)
+                return BadRequest(new { Message = "At least one positive logId is required." });
+
+            if (logIds.Count > 20)
+                return BadRequest(new { Message = "A maximum of 20 remote logs can be processed at once." });
+
+            var urlTemplate = _configuration["RemoteLogZipUrlTemplate"];
+            if (string.IsNullOrWhiteSpace(urlTemplate) ||
+                !urlTemplate.Contains("{logId}", StringComparison.Ordinal))
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, new
+                {
+                    Message = "RemoteLogZipUrlTemplate is not configured correctly."
+                });
+            }
+
+            var reportMode = request!.ReportMode?.Trim().StartsWith("comb", StringComparison.OrdinalIgnoreCase) == true
+                ? "combined"
+                : "separate";
+            var selectedBands = (request.Bands ?? new List<string>())
+                .SelectMany(value => (value ?? "").Split(new[] { ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries))
+                .Concat((request.BandFilter ?? "").Split(new[] { ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries))
+                .Select(value => value.Trim())
+                .Where(value => value.Length > 0 && !value.Equals("ALL", StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var selectedPlotInputs = ResolveSelectedPlotInputs(
+                new ZipReportUploadRequest { PlotInputs = request.PlotInputs }, null);
+            var fileGroups = ResolveRemoteFileGroups(logIds.Count, request.LogFileGroups);
+            var sheetNames = request.SheetNames?
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => SanitizeExcelSheetName(value))
+                .ToList();
+            var earfcnWise = ResolveEarfcnWise(request.EarfcnMode, request.EarfcnWise);
+            var filterByImageName = request.FilterByImageName ?? true;
+            var showSampleCount = request.ShowSampleCount ?? true;
+            var jobId = !string.IsNullOrWhiteSpace(request.JobId)
+                ? request.JobId.Trim()
+                : Guid.NewGuid().ToString("N");
+
+            var reportRequest = new ZipReportUploadRequest
+            {
+                JobId = jobId,
+                Title = request.Title,
+                ProjectName = string.IsNullOrWhiteSpace(request.ProjectName) ? request.Title : request.ProjectName,
+                BandFilter = request.BandFilter,
+                Bands = selectedBands,
+                EarfcnMode = request.EarfcnMode,
+                EarfcnWise = request.EarfcnWise,
+                FilterByImageName = filterByImageName,
+                ShowSampleCount = showSampleCount,
+                PlotInputs = selectedPlotInputs
+            };
+
+            ReportProgressTracker.Update(jobId, 1, "Remote report job queued...", 2);
+
+            _ = Task.Run(async () =>
+            {
+                var tempFiles = new List<(string TempPath, string OriginalFileName)>();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+
+                try
+                {
+                    for (var index = 0; index < logIds.Count; index++)
+                    {
+                        var logId = logIds[index];
+                        ReportProgressTracker.Update(
+                            jobId,
+                            2 + (int)(6.0 * index / logIds.Count),
+                            $"Downloading remote log {logId} ({index + 1}/{logIds.Count})...",
+                            2);
+
+                        var tempPath = Path.Combine(
+                            Path.GetTempPath(),
+                            $"signaltracker-remote-{logId}-{Guid.NewGuid():N}.zip");
+                        tempFiles.Add((tempPath, $"log_{logId}.zip"));
+                        await DownloadRemoteLogZipAsync(logId, urlTemplate, tempPath, timeout.Token);
+                        EnsureRemoteZipContainsReportPng(tempPath, logId);
+                    }
+
+                    ReportProgressTracker.Update(jobId, 9, "Remote logs downloaded. Reading archives...", 2);
+                    await ProcessGenerateFromZipAsync(
+                        jobId,
+                        tempFiles,
+                        reportRequest,
+                        fileGroups,
+                        earfcnWise,
+                        filterByImageName,
+                        reportMode,
+                        showSampleCount,
+                        sheetNames,
+                        selectedBands,
+                        selectedPlotInputs);
+                }
+                catch (OperationCanceledException)
+                {
+                    ReportProgressTracker.Fail(jobId, "Remote log download timed out.");
+                }
+                catch (Exception ex)
+                {
+                    ReportProgressTracker.Fail(jobId, ex.Message);
+                }
+                finally
+                {
+                    foreach (var (path, _) in tempFiles)
+                    {
+                        try { System.IO.File.Delete(path); } catch { }
+                    }
+                }
+            });
+
+            return Accepted(new
+            {
+                JobId = jobId,
+                Status = 2,
+                Message = "Remote log download and report generation started.",
+                ProgressUrl = $"/api/ExcelReport/Progress/{jobId}",
+                ProgressStreamUrl = $"/api/ExcelReport/ProgressStream/{jobId}",
+                DownloadUrl = $"/api/ExcelReport/Download/{jobId}"
+            });
+        }
+
+        private async Task DownloadRemoteLogZipAsync(
+            long logId,
+            string urlTemplate,
+            string destinationPath,
+            CancellationToken cancellationToken)
+        {
+            const long maximumZipBytes = 1_000_000_000;
+            var url = urlTemplate.Replace(
+                "{logId}",
+                logId.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal);
+
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+            {
+                throw new InvalidOperationException($"The configured ZIP URL for log {logId} is invalid.");
+            }
+
+            var client = _httpClientFactory.CreateClient();
+            using var response = await client.GetAsync(
+                uri,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(
+                    $"Remote log {logId} could not be downloaded (HTTP {(int)response.StatusCode}).");
+            }
+
+            if (response.Content.Headers.ContentLength > maximumZipBytes)
+                throw new InvalidOperationException($"Remote log {logId} exceeds the 1 GB size limit.");
+
+            await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
+            await using var output = new FileStream(
+                destinationPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 128 * 1024,
+                useAsync: true);
+
+            var buffer = new byte[128 * 1024];
+            long totalBytes = 0;
+            while (true)
+            {
+                var bytesRead = await input.ReadAsync(buffer, cancellationToken);
+                if (bytesRead == 0) break;
+
+                totalBytes += bytesRead;
+                if (totalBytes > maximumZipBytes)
+                    throw new InvalidOperationException($"Remote log {logId} exceeds the 1 GB size limit.");
+
+                await output.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+            }
+
+            if (totalBytes == 0)
+                throw new InvalidOperationException($"Remote log {logId} is empty.");
+        }
+
+        private static void EnsureRemoteZipContainsReportPng(string zipPath, long logId)
+        {
+            try
+            {
+                using var archive = ZipFile.OpenRead(zipPath);
+                var hasPng = archive.Entries.Any(entry =>
+                {
+                    if (entry.Length <= 0 ||
+                        !entry.FullName.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+
+                    var fileName = Path.GetFileNameWithoutExtension(entry.FullName);
+                    var match = Regex.Match(
+                        fileName,
+                        @"^(?:map_)?\d+_(?<header>[A-Za-z0-9_]+)$",
+                        RegexOptions.IgnoreCase);
+
+                    return match.Success &&
+                           ImageHeaders.Contains(
+                               match.Groups["header"].Value,
+                               StringComparer.OrdinalIgnoreCase);
+                });
+
+                if (!hasPng)
+                {
+                    throw new InvalidDataException(
+                        $"No indoor drive image is available for log {logId}. Please try manually uploading the log ZIP file.");
+                }
+            }
+            catch (InvalidDataException ex) when (!ex.Message.StartsWith("No indoor drive image", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"Remote log {logId} is not a valid ZIP file. Please try manually uploading the log ZIP file.",
+                    ex);
+            }
+        }
+
+        private static List<int> ResolveRemoteFileGroups(int fileCount, IReadOnlyList<int>? requestedGroups)
+        {
+            var groups = new List<int>(fileCount);
+            for (var index = 0; index < fileCount; index++)
+            {
+                groups.Add(
+                    requestedGroups != null && index < requestedGroups.Count && requestedGroups[index] > 0
+                        ? requestedGroups[index]
+                        : 1);
+            }
+
+            return groups;
         }
 
         private static async Task ProcessGenerateFromZipAsync(
