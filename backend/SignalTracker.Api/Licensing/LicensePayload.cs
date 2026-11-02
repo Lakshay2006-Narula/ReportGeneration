@@ -11,6 +11,12 @@ namespace SignalTracker.Licensing
         [JsonPropertyName("name")]
         public string? LicensedTo { get; set; }
 
+        [JsonPropertyName("cid")]
+        public long? CompanyId { get; set; }
+
+        [JsonPropertyName("cc")]
+        public string? CompanyCode { get; set; }
+
         [JsonPropertyName("iat")]
         public string? IssuedUtc { get; set; }
 

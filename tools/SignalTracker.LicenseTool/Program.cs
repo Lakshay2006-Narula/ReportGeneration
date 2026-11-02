@@ -56,14 +56,18 @@ static int IssueLicense(string[] args)
 {
     var machineId = RequireOption(args, "--machine");
     var licensedTo = GetOption(args, "--name") ?? "S-Tracer User";
+    var companyCode = RequireOption(args, "--company-code");
     var daysText = RequireOption(args, "--days");
     var privateKeySource = GetOption(args, "--private-key") ?? "";
     var outputPath = GetOption(args, "--out");
 
+    if (string.IsNullOrWhiteSpace(companyCode))
+        return Fail("--company-code is required.");
+
     if (!int.TryParse(daysText, out var days) || days <= 0)
         return Fail("--days must be a positive number.");
 
-    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, privateKeySource);
+    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource);
 
     if (!string.IsNullOrWhiteSpace(outputPath))
     {
@@ -88,6 +92,7 @@ static int InteractiveIssueLicense()
     var defaultPrivateKeyPath = FindDefaultPrivateKeyPath();
     var machineId = PromptRequired("Machine ID");
     var licensedTo = Prompt("Customer/company name", "S-Tracer User");
+    var companyCode = PromptRequired("Company code");
     var days = PromptPositiveInt("License duration in days", 365);
     var privateKeySource = HasEmbeddedPrivateKey()
         ? ""
@@ -96,7 +101,7 @@ static int InteractiveIssueLicense()
         "Output file",
         Path.Combine(AppContext.BaseDirectory, $"license-{SanitizeFileName(machineId)}-{days}d.txt"));
 
-    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, privateKeySource);
+    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource);
     File.WriteAllText(outputPath, licenseKey);
 
     Console.WriteLine();
@@ -111,7 +116,7 @@ static int InteractiveIssueLicense()
     return 0;
 }
 
-static string IssueLicenseCore(string machineId, int days, string licensedTo, string privateKeySource)
+static string IssueLicenseCore(string machineId, int days, string licensedTo, string companyCode, string privateKeySource)
 {
     var privateKey = string.IsNullOrWhiteSpace(privateKeySource)
         ? ReadEmbeddedPrivateKey()
@@ -122,7 +127,7 @@ static string IssueLicenseCore(string machineId, int days, string licensedTo, st
     var issuedUtc = DateTimeOffset.UtcNow;
     var expiresUtc = issuedUtc.AddDays(days);
     var payloadJson =
-        $"{{\"mid\":\"{EscapeJson(machineId.Trim())}\",\"name\":\"{EscapeJson(licensedTo.Trim())}\",\"iat\":\"{issuedUtc:O}\",\"exp\":\"{expiresUtc:O}\"}}";
+        $"{{\"mid\":\"{EscapeJson(machineId.Trim())}\",\"name\":\"{EscapeJson(licensedTo.Trim())}\",\"cc\":\"{EscapeJson(companyCode.Trim())}\",\"iat\":\"{issuedUtc:O}\",\"exp\":\"{expiresUtc:O}\"}}";
     var payloadBytes = Encoding.UTF8.GetBytes(payloadJson);
 
     using var ecdsa = ECDsa.Create();
@@ -267,5 +272,5 @@ static void PrintUsage()
     Console.WriteLine("Usage:");
     Console.WriteLine("  STracerLicenseGenerator.exe");
     Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- genkeys --out license-keys");
-    Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- issue --machine XXXX-XXXX-XXXX-XXXX --days 365 --name \"Customer\"");
+    Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- issue --machine XXXX-XXXX-XXXX-XXXX --company-code ABC --days 365 --name \"Customer\"");
 }

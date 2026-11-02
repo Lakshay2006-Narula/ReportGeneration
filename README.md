@@ -142,7 +142,7 @@ Update all of these files when releasing a new desktop version:
 - `src-tauri/tauri.conf.json`
 - `src-tauri/Cargo.toml`
 
-The current app version is `2.0.1`.
+The current app version is `2.0.2`.
 
 ## Production Notes
 

@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tauri::{path::BaseDirectory, AppHandle, Manager};
+use tauri::{
+    path::BaseDirectory,
+    AppHandle, Manager,
+};
 
 #[cfg(debug_assertions)]
 const BACKEND_ADDRESS: &str = "127.0.0.1:5000";

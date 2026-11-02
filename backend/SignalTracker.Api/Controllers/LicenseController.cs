@@ -28,6 +28,8 @@ namespace SignalTracker.Controllers
                 activated = status.Activated,
                 machineId = status.MachineId,
                 licensedTo = status.LicensedTo,
+                companyId = status.CompanyId,
+                companyCode = status.CompanyCode,
                 expiresUtc = status.ExpiresUtc,
                 error = status.Activated ? null : status.Error
             });
@@ -54,8 +56,24 @@ namespace SignalTracker.Controllers
                 activated = status.Activated,
                 machineId = status.MachineId,
                 licensedTo = status.LicensedTo,
+                companyId = status.CompanyId,
+                companyCode = status.CompanyCode,
                 expiresUtc = status.ExpiresUtc
             });
+        }
+
+        [HttpDelete("current")]
+        public IActionResult DeleteCurrent()
+        {
+            try
+            {
+                var status = _licenseService.Deactivate();
+                return Ok(new { activated = status.Activated, machineId = status.MachineId });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return StatusCode(500, new { message = "Could not remove the saved license." });
+            }
         }
     }
 }

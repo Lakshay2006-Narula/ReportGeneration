@@ -1,6 +1,6 @@
 {
   "name": "stracer-report-generator",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "private": true,
   "description": "Indoor Report desktop generator built with Next.js and Tauri.",
   "scripts": {

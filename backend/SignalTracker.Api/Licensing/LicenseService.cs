@@ -10,6 +10,8 @@ namespace SignalTracker.Licensing
         public bool Activated { get; set; }
         public string MachineId { get; set; } = "";
         public string? LicensedTo { get; set; }
+        public long? CompanyId { get; set; }
+        public string? CompanyCode { get; set; }
         public DateTime? ExpiresUtc { get; set; }
         public string? Error { get; set; }
     }
@@ -54,20 +56,31 @@ namespace SignalTracker.Licensing
             lock (_lock)
             {
                 var status = ValidateLicenseKey(licenseKey);
-                if (status.Activated)
+                if (!status.Activated)
+                    return status;
+
+                try
                 {
-                    try
-                    {
-                        PersistLicenseKey(licenseKey);
-                    }
-                    catch (Exception ex)
-                    {
-                        status = NotActivated($"License is valid, but it could not be saved: {ex.Message}");
-                    }
+                    PersistLicenseKey(licenseKey);
+                }
+                catch (Exception ex)
+                {
+                    return NotActivated($"License is valid, but it could not be saved: {ex.Message}");
                 }
 
                 _cachedStatus = status;
                 return status;
+            }
+        }
+
+        public LicenseStatus Deactivate()
+        {
+            lock (_lock)
+            {
+                if (File.Exists(LicenseFilePath))
+                    File.Delete(LicenseFilePath);
+
+                return _cachedStatus = NotActivated();
             }
         }
 
@@ -105,7 +118,17 @@ namespace SignalTracker.Licensing
             Directory.CreateDirectory(LicenseDirectory);
             var plainBytes = Encoding.UTF8.GetBytes(licenseKey);
             var protectedBytes = ProtectedData.Protect(plainBytes, null, DataProtectionScope.CurrentUser);
-            File.WriteAllBytes(LicenseFilePath, protectedBytes);
+            var temporaryPath = Path.Combine(LicenseDirectory, $"license-{Guid.NewGuid():N}.tmp");
+            try
+            {
+                File.WriteAllBytes(temporaryPath, protectedBytes);
+                File.Move(temporaryPath, LicenseFilePath, true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                    File.Delete(temporaryPath);
+            }
         }
 
         private static string ResolveWritableLicenseDirectory()
@@ -228,6 +251,8 @@ namespace SignalTracker.Licensing
                 Activated = true,
                 MachineId = MachineId,
                 LicensedTo = payload.LicensedTo,
+                CompanyId = payload.CompanyId,
+                CompanyCode = payload.CompanyCode,
                 ExpiresUtc = expiresUtc
             };
         }

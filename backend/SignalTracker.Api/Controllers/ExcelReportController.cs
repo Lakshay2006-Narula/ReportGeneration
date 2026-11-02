@@ -517,7 +517,7 @@ namespace SignalTracker.Controllers
                 .Select(value => SanitizeExcelSheetName(value))
                 .ToList();
             var earfcnWise = ResolveEarfcnWise(request.EarfcnMode, request.EarfcnWise);
-            var filterByImageName = request.FilterByImageName ?? true;
+            var filterByImageName = request.FilterByImageName ?? request.FilteredByImageName ?? true;
             var showSampleCount = request.ShowSampleCount ?? true;
             var jobId = !string.IsNullOrWhiteSpace(request.JobId)
                 ? request.JobId.Trim()

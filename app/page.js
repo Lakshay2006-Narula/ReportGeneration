@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Copy,
+  Download,
   FileArchive,
   FileSpreadsheet,
   KeyRound,
@@ -12,6 +13,7 @@ import {
   Loader2,
   Moon,
   Plus,
+  RefreshCw,
   Search,
   ShieldCheck,
   Sun,
@@ -23,6 +25,7 @@ const API_BASE_URL =
   process.env.NODE_ENV === "development" ? "http://127.0.0.1:5000" : "http://127.0.0.1:48327";
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
 const MAX_FILE_SIZE_LABEL = "500 MB";
+const MAX_TOTAL_FILE_SIZE = 900 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 7200000;
 
 const REPORT_TYPE_OPTIONS = {
@@ -302,6 +305,14 @@ const postJson = async (path, payload) => {
   return response.json();
 };
 
+const deleteJson = async (path) => {
+  const response = await requestWithTimeout(makeApiUrl(path), { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await parseErrorMessage(response));
+  }
+  return response.json();
+};
+
 const downloadBlob = async (blob, fileName) => {
   // Desktop app: ask the user where to save. Falls back to a browser download elsewhere.
   if (typeof window !== "undefined" && window.__TAURI_INTERNALS__) {
@@ -356,18 +367,29 @@ export default function Home() {
   const [theme, setTheme] = useState("light");
   const [licenseStatus, setLicenseStatus] = useState(null);
   const [licenseKey, setLicenseKey] = useState("");
+  const [requestedCompanyCode, setRequestedCompanyCode] = useState("");
   const [licenseLoading, setLicenseLoading] = useState(true);
   const [licenseSaving, setLicenseSaving] = useState(false);
+  const [licenseRemoving, setLicenseRemoving] = useState(false);
   const [licenseError, setLicenseError] = useState("");
   const [licenseMessage, setLicenseMessage] = useState("");
   const [showMachineId, setShowMachineId] = useState(false);
+  const [confirmLicenseRemoval, setConfirmLicenseRemoval] = useState(false);
+  const [appMode, setAppMode] = useState("offline");
   const [licenseStep, setLicenseStep] = useState(1);
+  const [workflowStep, setWorkflowStep] = useState("upload");
   const [isDragActive, setIsDragActive] = useState(false);
   const [reportFiles, setReportFiles] = useState([]);
+  const [remoteSessions, setRemoteSessions] = useState([]);
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [selectedRemoteLogIds, setSelectedRemoteLogIds] = useState({});
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteDownloading, setRemoteDownloading] = useState(false);
+  const [remoteDownloadProgress, setRemoteDownloadProgress] = useState(null);
+  const [downloadedRemoteFiles, setDownloadedRemoteFiles] = useState([]);
   const [reportTitle, setReportTitle] = useState("");
   const [reportType, setReportType] = useState("excel");
   const [reportMode, setReportMode] = useState("separate");
-  const [filterByImageName, setFilterByImageName] = useState(false);
   const [showSampleCount, setShowSampleCount] = useState(false);
   const [selectedPlotInputs, setSelectedPlotInputs] = useState(() => PLOT_INPUT_OPTIONS.map((option) => option.value));
   const [reportSheetNames, setReportSheetNames] = useState({});
@@ -381,7 +403,23 @@ export default function Home() {
   const [error, setError] = useState("");
 
   const reportOption = REPORT_TYPE_OPTIONS[reportType] || REPORT_TYPE_OPTIONS.excel;
-  const isReportBusy = discoverLoading || generateLoading;
+  const isReportBusy = discoverLoading || generateLoading || remoteLoading || remoteDownloading;
+  const licensedCompanyCode = licenseStatus?.companyCode ?? licenseStatus?.CompanyCode ?? "";
+  const activeReportFiles = appMode === "online" ? downloadedRemoteFiles : reportFiles;
+  const selectedRemoteLogs = useMemo(
+    () => remoteSessions.filter((session) => selectedRemoteLogIds[String(session.LogId ?? session.logId)]),
+    [remoteSessions, selectedRemoteLogIds]
+  );
+  const filteredRemoteSessions = useMemo(() => {
+    const query = sessionSearch.trim().toLowerCase();
+    if (!query) return remoteSessions;
+
+    return remoteSessions.filter((session) =>
+      [session.LogId ?? session.logId, session.UserId ?? session.userId, session.FileName ?? session.fileName]
+        .some((value) => String(value ?? "").toLowerCase().includes(query))
+    );
+  }, [remoteSessions, sessionSearch]);
+  const visibleRemoteSessions = workflowStep === "configure" ? selectedRemoteLogs : filteredRemoteSessions;
   const selectedBandNames = useMemo(
     () => getSelectedBandsFromFileBands(discoveredBands, selectedFileBands),
     [discoveredBands, selectedFileBands]
@@ -390,6 +428,7 @@ export default function Home() {
   const resetDiscovery = useCallback(() => {
     setDiscoveredBands([]);
     setSelectedFileBands({});
+    setWorkflowStep("upload");
     setError("");
     setMessage("");
   }, []);
@@ -425,23 +464,27 @@ export default function Home() {
 
   useEffect(() => {
     setReportSheetNames((prev) => {
-      const next = {};
-      reportFiles.forEach((file, index) => {
-        const key = getReportFileKey(file);
-        next[key] = prev[key] ?? getDefaultSheetName(file, index);
+      const next = { ...prev };
+      [reportFiles, downloadedRemoteFiles].forEach((files) => {
+        files.forEach((file, index) => {
+          const key = getReportFileKey(file);
+          next[key] = prev[key] ?? getDefaultSheetName(file, index);
+        });
       });
       return next;
     });
 
     setReportFileGroups((prev) => {
-      const next = {};
-      reportFiles.forEach((file, index) => {
-        const key = getReportFileKey(file);
-        next[key] = String(prev[key] ?? index + 1);
+      const next = { ...prev };
+      [reportFiles, downloadedRemoteFiles].forEach((files) => {
+        files.forEach((file, index) => {
+          const key = getReportFileKey(file);
+          next[key] = String(prev[key] ?? index + 1);
+        });
       });
       return next;
     });
-  }, [reportFiles]);
+  }, [reportFiles, downloadedRemoteFiles]);
 
   const addFiles = useCallback(
     (fileList) => {
@@ -482,7 +525,7 @@ export default function Home() {
   );
 
   const handleDiscoverBands = async () => {
-    if (!reportFiles.length) return;
+    if (!activeReportFiles.length) return;
     setDiscoverLoading(true);
     setError("");
     setMessage("");
@@ -491,8 +534,8 @@ export default function Home() {
 
     try {
       const formData = new FormData();
-      reportFiles.forEach((file) => formData.append(reportOption.fileField, file));
-      formData.append("FilterByImageName", String(filterByImageName));
+      activeReportFiles.forEach((file) => formData.append(reportOption.fileField, file));
+      formData.append("FilterByImageName", "true");
 
       const response = await postFormJson(reportOption.discoverPath, formData);
       const bandsList = normalizeDiscoveredBands(
@@ -522,6 +565,7 @@ export default function Home() {
 
       setDiscoveredBands(displayBands);
       setSelectedFileBands(nextSelected);
+      setWorkflowStep("configure");
       setMessage("Bands discovered.");
     } catch (err) {
       setError(err?.message || "Failed to discover bands.");
@@ -530,9 +574,94 @@ export default function Home() {
     }
   };
 
+  const handleFetchRemoteSessions = async () => {
+    if (!licensedCompanyCode) {
+      setError("This license does not include a company code.");
+      return;
+    }
+
+    setRemoteLoading(true);
+    setError("");
+    setMessage("");
+    setRemoteSessions([]);
+    setSelectedRemoteLogIds({});
+    setDownloadedRemoteFiles([]);
+    setRemoteDownloadProgress(null);
+    resetDiscovery();
+
+    try {
+      const sessions = [];
+      const pageSize = 200;
+      for (let page = 1; ; page += 1) {
+        const response = await getJson(`/api/RemoteSessions?page=${page}&pageSize=${pageSize}`);
+        const batch = Array.isArray(response?.sessions) ? response.sessions : response?.Sessions;
+        if (!Array.isArray(batch)) throw new Error("Remote session response is invalid.");
+        sessions.push(...batch);
+        if (batch.length < pageSize) break;
+      }
+
+      setRemoteSessions(sessions);
+      if (!sessions.length) setMessage("No remote sessions found for this company.");
+    } catch (err) {
+      setError(err?.message || "Failed to load remote logs.");
+    } finally {
+      setRemoteLoading(false);
+    }
+  };
+
+  const fetchSelectedRemoteZips = async (onProgress) => {
+    const files = [];
+    let totalBytes = 0;
+    for (const [index, session] of selectedRemoteLogs.entries()) {
+      const logId = session.LogId ?? session.logId;
+      onProgress?.(index + 1, selectedRemoteLogs.length);
+      const { blob } = await getBlob(`/api/RemoteSessions/${encodeURIComponent(logId)}/zip`);
+      if (!blob.size || blob.size > MAX_FILE_SIZE) {
+        throw new Error(`Log ${logId} is empty or exceeds ${MAX_FILE_SIZE_LABEL}.`);
+      }
+      totalBytes += blob.size;
+      if (totalBytes > MAX_TOTAL_FILE_SIZE) {
+        throw new Error("Selected ZIPs exceed the 900 MB report upload limit. Select fewer drives.");
+      }
+      files.push(new File([blob], `log_${logId}.zip`, { type: "application/zip" }));
+    }
+    return files;
+  };
+
+  const handleDownloadRemoteZips = async () => {
+    if (!selectedRemoteLogs.length) return;
+
+    setRemoteDownloading(true);
+    setDownloadedRemoteFiles([]);
+    resetDiscovery();
+
+    try {
+      const files = await fetchSelectedRemoteZips((current, total) => {
+        setRemoteDownloadProgress({ current, total });
+      });
+      setDownloadedRemoteFiles(files);
+      setMessage(`${files.length} ZIP ${files.length === 1 ? "file" : "files"} ready. Find bands to continue.`);
+    } catch (err) {
+      setError(err?.message || "Failed to download selected ZIPs.");
+    } finally {
+      setRemoteDownloading(false);
+      setRemoteDownloadProgress(null);
+    }
+  };
+
   const handleGenerateReport = async () => {
-    if (!reportFiles.length) {
+    if (!activeReportFiles.length) {
       setError("Add at least one ZIP file.");
+      return;
+    }
+
+    if (discoveredBands.length > 0 && selectedBandNames.length === 0) {
+      setError("Select at least one band.");
+      return;
+    }
+
+    if (selectedPlotInputs.length === 0) {
+      setError("Select at least one KPI plot.");
       return;
     }
 
@@ -542,32 +671,29 @@ export default function Home() {
     setMessage("");
 
     try {
+      const filesForReport = appMode === "online"
+        ? await fetchSelectedRemoteZips((current, total) => {
+            setReportProgress({
+              progress: 3 + Math.round((current / total) * 6),
+              stage: `Downloading session ZIP ${current}/${total}...`
+            });
+          })
+        : activeReportFiles;
+      setReportProgress({ progress: 10, stage: "Preparing report..." });
       const formData = new FormData();
-      reportFiles.forEach((file) => formData.append(reportOption.fileField, file));
+      filesForReport.forEach((file) => formData.append(reportOption.fileField, file));
       formData.append("Title", reportTitle || "");
       formData.append("ProjectName", reportTitle || "");
-      formData.append("FilterByImageName", String(filterByImageName));
+      formData.append("FilterByImageName", "true");
       formData.append("ShowSampleCount", String(showSampleCount));
       selectedPlotInputs.forEach((plotInput) => formData.append("PlotInputs", plotInput));
 
       if (reportType === "excel") {
         formData.append("ReportMode", reportMode);
-        const fileGroups = reportMode === "combined" ? buildReportFileGroups(reportFiles, reportFileGroups) : [];
-        const sheetNames = buildReportSheetNames(reportFiles, reportSheetNames, reportMode, fileGroups);
+        const fileGroups = reportMode === "combined" ? buildReportFileGroups(activeReportFiles, reportFileGroups) : [];
+        const sheetNames = buildReportSheetNames(activeReportFiles, reportSheetNames, reportMode, fileGroups);
         if (sheetNames.length) formData.append("SheetNames", sheetNames.join(","));
         if (reportMode === "combined") formData.append("LogFileGroups", fileGroups.join(","));
-      }
-
-      if (discoveredBands.length > 0 && selectedBandNames.length === 0) {
-        setError("Select at least one band.");
-        setGenerateLoading(false);
-        return;
-      }
-
-      if (selectedPlotInputs.length === 0) {
-        setError("Select at least one KPI plot.");
-        setGenerateLoading(false);
-        return;
       }
 
       if (selectedBandNames.length) {
@@ -609,7 +735,7 @@ export default function Home() {
       const { blob, contentDisposition } = await getBlob(downloadPath);
       const safeBands = selectedBandNames.join("-") || "ALL";
       const safeBaseName =
-        reportFiles.length === 1 ? reportFiles[0].name.replace(/\.zip$/i, "") : `${reportFiles.length}_logs`;
+        activeReportFiles.length === 1 ? activeReportFiles[0].name.replace(/\.zip$/i, "") : `${activeReportFiles.length}_logs`;
       const extension = reportOption.extension;
       const titleName = sanitizeFileName(reportTitle);
       const fileName = titleName
@@ -660,11 +786,43 @@ export default function Home() {
       const status = await postJson("/api/license/activate", { licenseKey });
       setLicenseStatus(status);
       setLicenseKey("");
-      setLicenseMessage(`Activated for ${formatExpiry(status.expiresUtc)}.`);
+      setRemoteSessions([]);
+      setSelectedRemoteLogIds({});
+      setDownloadedRemoteFiles([]);
+      setWorkflowStep("upload");
+      setShowMachineId(false);
+      setConfirmLicenseRemoval(false);
+      setMessage(`License activated until ${formatExpiry(status.expiresUtc)}.`);
     } catch (err) {
       setLicenseError(err?.message || "License activation failed.");
     } finally {
       setLicenseSaving(false);
+    }
+  };
+
+  const handleRemoveLicense = async () => {
+    if (isReportBusy || licenseSaving || licenseRemoving) return;
+    setLicenseRemoving(true);
+    setLicenseError("");
+    setLicenseMessage("");
+
+    try {
+      const status = await deleteJson("/api/license/current");
+      setLicenseStatus(status);
+      setLicenseKey("");
+      setRemoteSessions([]);
+      setSelectedRemoteLogIds({});
+      setDownloadedRemoteFiles([]);
+      setAppMode("offline");
+      setWorkflowStep("upload");
+      setLicenseStep(1);
+      setShowMachineId(false);
+      setConfirmLicenseRemoval(false);
+      setLicenseMessage("Current license removed. Request a new key for this Machine ID and company code.");
+    } catch (err) {
+      setLicenseError(err?.message || "Could not remove the current license.");
+    } finally {
+      setLicenseRemoving(false);
     }
   };
 
@@ -680,13 +838,467 @@ export default function Home() {
     }
   };
 
+  const copyLicenseRequest = async () => {
+    const companyCode = requestedCompanyCode.trim();
+    const machineId = licenseStatus?.machineId;
+    if (!machineId || !companyCode) return;
+
+    try {
+      await navigator.clipboard.writeText(`Machine ID: ${machineId}\nCompany code: ${companyCode}`);
+      setLicenseError("");
+      setLicenseMessage("License request copied.");
+    } catch {
+      setLicenseError("Could not copy the license request.");
+    }
+  };
+
+  const uploadPanel = (
+    <div className="glass-panel animate-rise-delay p-4 sm:p-5">
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".zip,application/zip,application/x-zip-compressed"
+        multiple
+        hidden
+        onChange={(event) => {
+          addFiles(event.target.files);
+          event.target.value = "";
+        }}
+      />
+
+      {reportFiles.length === 0 ? (
+        <div
+          className={`upload-zone group ${isDragActive ? "upload-zone-active" : ""}`}
+          onDragEnter={() => setIsDragActive(true)}
+          onDragLeave={() => setIsDragActive(false)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            setIsDragActive(false);
+            addFiles(event.dataTransfer.files);
+          }}
+          onClick={() => inputRef.current?.click()}
+          role="button"
+          tabIndex={0}
+        >
+          <div className="upload-icon">
+            <UploadCloud className="h-7 w-7 text-teal-700 transition-all duration-500 group-hover:-translate-y-1 dark:text-cyan-200" />
+          </div>
+          <div className="text-center">
+            <strong className="block text-xl font-black text-slate-950 transition-colors duration-500 dark:text-white">
+              Upload log ZIP files
+            </strong>
+            <span className="mt-2 block text-sm font-semibold text-slate-500 transition-colors duration-500 dark:text-slate-400">
+              .zip, max {MAX_FILE_SIZE_LABEL} each
+            </span>
+          </div>
+        </div>
+      ) : (
+        <div
+          className={`compact-upload ${isDragActive ? "compact-upload-active" : ""}`}
+          onDragEnter={() => setIsDragActive(true)}
+          onDragLeave={() => setIsDragActive(false)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            setIsDragActive(false);
+            addFiles(event.dataTransfer.files);
+          }}
+        >
+          <div>
+            <span className="text-xs font-black uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
+              Uploaded ZIP files
+            </span>
+            <strong className="mt-1 block text-sm font-black">{reportFiles.length} selected</strong>
+          </div>
+          <button className="add-file-button" type="button" aria-label="Add ZIP files" onClick={() => inputRef.current?.click()}>
+            <Plus className="h-5 w-5" />
+          </button>
+        </div>
+      )}
+
+      {reportFiles.length > 0 && (
+        <div className="mt-4 grid gap-3">
+          {reportFiles.map((file, index) => (
+            <div className="glass-row group flex items-center gap-3" key={getReportFileKey(file)}>
+              <button
+                className="icon-action"
+                type="button"
+                aria-label={`Remove ${file.name}`}
+                onClick={() => {
+                  setReportFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
+                  resetDiscovery();
+                }}
+              >
+                <X className="h-4 w-4" />
+              </button>
+              <FileArchive className="h-5 w-5 flex-none text-teal-700 dark:text-cyan-200" />
+              <div className="min-w-0 flex-1">
+                <strong className="block truncate text-sm font-black" title={file.name}>
+                  {file.name}
+                </strong>
+                <span className="text-xs font-semibold text-slate-500 transition-colors duration-500 dark:text-slate-400">
+                  {formatBytes(file.size)}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const reportOptionsPanel = (
+    <div className="glass-panel animate-rise-delay-2 p-4 sm:p-5">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <label className="field-label">
+          <span>Report Title</span>
+          <input className="field-input" value={reportTitle} onChange={(event) => setReportTitle(event.target.value)} />
+        </label>
+        <label className="field-label">
+          <span>Report Type</span>
+          <select
+            className="field-input"
+            value={reportType}
+            onChange={(event) => {
+              setReportType(event.target.value);
+              setReportMode("separate");
+              resetDiscovery();
+            }}
+          >
+            <option value="excel">Excel</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        {reportType === "excel" && (
+          <div className="field-label sm:col-span-2">
+            <span>Report Mode</span>
+            <div className="mac-segment" role="tablist" aria-label="Report mode">
+              {[
+                ["separate", "Separate"],
+                ["combined", "Combined"]
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  aria-selected={reportMode === value}
+                  className={reportMode === value ? "mac-segment-button mac-segment-button-active" : "mac-segment-button"}
+                  onClick={() => setReportMode(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <label className="glass-check">
+          <input
+            type="checkbox"
+            checked={showSampleCount}
+            onChange={(event) => setShowSampleCount(event.target.checked)}
+          />
+          <span>Show sample count</span>
+        </label>
+      </div>
+
+      {reportType === "excel" && reportMode === "combined" && activeReportFiles.length > 0 && (
+        <div className="mt-4 grid max-h-72 gap-3 overflow-auto pr-1">
+          {activeReportFiles.map((file, index) => {
+            const key = getReportFileKey(file);
+            return (
+              <div className="glass-row grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px_82px]" key={key}>
+                <div className="min-w-0">
+                  <span className="text-xs font-black uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
+                    ZIP File
+                  </span>
+                  <strong className="mt-1 block truncate text-sm font-black" title={file.name}>
+                    {file.name}
+                  </strong>
+                </div>
+                <label className="field-label">
+                  <span>Sheet Name</span>
+                  <input
+                    className="field-input"
+                    value={reportSheetNames[key] || ""}
+                    onChange={(event) => setReportSheetNames((prev) => ({ ...prev, [key]: event.target.value }))}
+                    placeholder={`Floor ${index + 1}`}
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Group</span>
+                  <input
+                    className="field-input"
+                    value={reportFileGroups[key] ?? String(index + 1)}
+                    onChange={(event) => setReportFileGroups((prev) => ({ ...prev, [key]: event.target.value }))}
+                  />
+                </label>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {reportType === "excel" && (
+        <div className="mt-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <label className="field-label min-w-0">
+              <span>KPI Plots</span>
+              <strong className="text-sm font-black">{selectedPlotInputs.length} selected</strong>
+            </label>
+            <div className="flex gap-2">
+              <button className="btn-ghost" type="button" onClick={() => setAllPlotInputs(true)}>
+                Select all
+              </button>
+              <button className="btn-ghost" type="button" onClick={() => setAllPlotInputs(false)}>
+                Clear
+              </button>
+            </div>
+          </div>
+          <div className="grid max-h-48 gap-2 overflow-auto pr-1 sm:grid-cols-2">
+            {PLOT_INPUT_OPTIONS.map((option) => (
+              <label className="glass-check min-w-0" key={option.value}>
+                <input
+                  type="checkbox"
+                  checked={selectedPlotInputs.includes(option.value)}
+                  onChange={() => togglePlotInput(option.value)}
+                />
+                <span className="truncate" title={option.label}>
+                  {option.label}
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  const bandsPanel = discoveredBands.length > 0 && (
+    <section className="glass-panel animate-rise p-4 sm:p-5">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-xl font-black">Discovered File Bands</h2>
+          <span className="text-sm font-bold text-slate-500 transition-colors duration-500 dark:text-slate-400">
+            {selectedBandNames.length} selected
+          </span>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn-ghost" type="button" onClick={() => setAllFileBands(true)}>
+            Select all
+          </button>
+          <button className="btn-ghost" type="button" onClick={() => setAllFileBands(false)}>
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div className="grid max-h-[420px] gap-3 overflow-auto pr-1 md:grid-cols-2">
+        {discoveredBands.map((band, index) => {
+          const files =
+            Array.isArray(band.Files) && band.Files.length > 0
+              ? band.Files
+              : [{ FileName: "All Files", Count: band.Count, Percentage: band.Percentage }];
+
+          return (
+            <div className="band-card group" key={`${band.Band}-${index}`}>
+              <div className="flex items-start justify-between gap-3">
+                <strong className="text-base font-black">{band.Band}</strong>
+                <span className="rounded-full border border-white/50 bg-white/30 px-2 py-1 text-xs font-black text-slate-600 backdrop-blur transition-all duration-500 dark:border-white/10 dark:bg-white/10 dark:text-slate-300">
+                  {band.Count !== null ? `${band.Count} rows` : "Band"}
+                  {band.Percentage !== null ? ` ${band.Percentage}%` : ""}
+                </span>
+              </div>
+              <div className="mt-3 grid gap-2">
+                {files.map((fileBand, fileIndex) => {
+                  const key = getFileBandKey(fileBand.FileName, band.Band);
+                  return (
+                    <label className="glass-check min-w-0" key={`${key}-${fileIndex}`}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedFileBands[key])}
+                        onChange={() =>
+                          setSelectedFileBands((prev) => ({
+                            ...prev,
+                            [key]: !prev[key]
+                          }))
+                        }
+                      />
+                      <span className="truncate" title={fileBand.FileName}>
+                        {fileBand.FileName}: {fileBand.Count ?? 0}
+                        {fileBand.Percentage !== null ? ` (${fileBand.Percentage}%)` : ""}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+
+  const updateRemoteSelection = (next) => {
+    setSelectedRemoteLogIds(next);
+    setDownloadedRemoteFiles([]);
+    resetDiscovery();
+  };
+
+  const remoteLogsPanel = (
+    <section className="glass-panel animate-rise p-4 sm:p-5">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-black">Remote Drives</h2>
+          <span className="text-sm font-bold text-slate-500 dark:text-slate-400">
+            {selectedRemoteLogs.length} selected
+            {workflowStep === "upload" && ` of ${remoteSessions.length}`}
+            {workflowStep === "upload" && sessionSearch.trim() && ` / ${filteredRemoteSessions.length} shown`}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {workflowStep === "upload" && remoteSessions.length > 0 && (
+            <>
+              <button className="btn-ghost" type="button" disabled={isReportBusy || filteredRemoteSessions.length === 0} onClick={() => {
+                const next = { ...selectedRemoteLogIds };
+                filteredRemoteSessions.forEach((session) => {
+                  const logId = session.LogId ?? session.logId;
+                  if (logId) next[String(logId)] = true;
+                });
+                updateRemoteSelection(next);
+              }}>
+                {sessionSearch.trim() ? "Select shown" : "Select all"}
+              </button>
+              <button className="btn-ghost" type="button" disabled={isReportBusy || filteredRemoteSessions.length === 0} onClick={() => {
+                const next = { ...selectedRemoteLogIds };
+                filteredRemoteSessions.forEach((session) => {
+                  delete next[String(session.LogId ?? session.logId)];
+                });
+                updateRemoteSelection(next);
+              }}>
+                {sessionSearch.trim() ? "Clear shown" : "Clear"}
+              </button>
+            </>
+          )}
+          {workflowStep === "upload" && (
+            <button
+              className="header-theme-button"
+              type="button"
+              aria-label="Refresh remote drives"
+              title="Refresh remote drives"
+              disabled={isReportBusy || !licensedCompanyCode}
+              onClick={handleFetchRemoteSessions}
+            >
+              <RefreshCw className={`h-4 w-4 ${remoteLoading ? "animate-spin" : ""}`} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {workflowStep === "upload" && remoteSessions.length > 0 && (
+        <div className="relative mb-3">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-slate-400" aria-hidden="true" />
+          <input
+            className="field-input pl-10 pr-10"
+            type="text"
+            role="searchbox"
+            aria-label="Search sessions"
+            placeholder="Search sessions"
+            value={sessionSearch}
+            onChange={(event) => setSessionSearch(event.target.value)}
+          />
+          {sessionSearch && (
+            <button
+              className="absolute right-2 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-md text-slate-500 hover:bg-white/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-teal-600 dark:text-slate-300 dark:hover:bg-white/10"
+              type="button"
+              aria-label="Clear session search"
+              title="Clear search"
+              onClick={() => setSessionSearch("")}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {remoteLoading ? (
+        <div className="flex items-center gap-2 py-6 text-sm font-semibold text-slate-600 dark:text-slate-300">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading drives...
+        </div>
+      ) : remoteSessions.length === 0 ? (
+        <p className="py-6 text-sm font-medium text-slate-600 dark:text-slate-300">No drives available.</p>
+      ) : visibleRemoteSessions.length === 0 ? (
+        <p className="py-6 text-sm font-medium text-slate-600 dark:text-slate-300">
+          {workflowStep === "configure" ? "No sessions selected." : "No sessions match your search."}
+        </p>
+      ) : (
+        <div className="grid max-h-[360px] gap-2 overflow-auto pr-1 sm:grid-cols-2">
+          {visibleRemoteSessions.map((session) => {
+            const logId = session.LogId ?? session.logId;
+            const userId = session.UserId ?? session.userId;
+            return (
+              <label className="glass-check min-w-0" key={String(logId)}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(selectedRemoteLogIds[String(logId)])}
+                  disabled={isReportBusy || workflowStep === "configure"}
+                  onChange={() => updateRemoteSelection((prev) => ({
+                    ...prev,
+                    [String(logId)]: !prev[String(logId)]
+                  }))}
+                />
+                <span className="min-w-0 flex-1">
+                  <strong className="block truncate text-sm" title={`Drive ${logId}`}>Drive {logId}</strong>
+                  <span className="block truncate text-xs font-medium text-slate-500 dark:text-slate-400">
+                    log_{logId}.zip{userId ? ` - User ${userId}` : ""}
+                  </span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      {workflowStep === "upload" && selectedRemoteLogs.length > 0 && (
+        <div className="mt-4 border-t border-slate-300/60 pt-4 dark:border-white/10">
+          <div className="flex justify-end">
+            <button
+              className="btn-secondary flex items-center justify-center gap-2"
+              type="button"
+              onClick={handleDownloadRemoteZips}
+              disabled={isReportBusy}
+            >
+              {remoteDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {remoteDownloading ? `Downloading ${remoteDownloadProgress?.current || 1}/${remoteDownloadProgress?.total || selectedRemoteLogs.length}...` : "Download selected ZIPs"}
+            </button>
+          </div>
+          {downloadedRemoteFiles.length > 0 && (
+            <div className="mt-4 flex flex-col gap-3 border-t border-slate-300/60 pt-4 dark:border-white/10 sm:flex-row sm:items-center sm:justify-between">
+              <span className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+                {downloadedRemoteFiles.length} ZIP {downloadedRemoteFiles.length === 1 ? "file" : "files"} ready
+              </span>
+              <button
+                className="btn-primary flex items-center justify-center gap-2"
+                type="button"
+                onClick={handleDiscoverBands}
+                disabled={isReportBusy}
+              >
+                {discoverLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                {discoverLoading ? "Finding bands..." : "Find Bands"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+
   if (licenseLoading || !licenseStatus?.activated) {
     const steps = ["Machine ID", "License Key"];
     return (
-      <main className="relative grid min-h-screen place-items-center overflow-hidden bg-slate-100 px-4 py-8 text-slate-950 transition-colors duration-700 dark:bg-[#071016] dark:text-slate-50">
-        <div className="motion-grid" />
-        <div className="scanline" />
-
+      <main className="app-shell relative grid min-h-screen place-items-center px-4 py-8 text-slate-950 dark:text-slate-50">
         <section className="glass-panel wizard-card relative z-10 w-full max-w-lg p-6 sm:p-8">
           <div className="wizard-head">
             <img className="app-mark-large" src="/toollogo.svg" alt="Indoor Report" />
@@ -710,7 +1322,7 @@ export default function Home() {
           {licenseStep === 1 ? (
             <div className="grid gap-4 animate-pop">
               <p className="text-sm font-semibold leading-6 text-slate-600 dark:text-slate-300">
-                Copy this machine ID and send it to Vinfocom to receive your license key.
+                Send this Machine ID and company code to Vinfocom to receive a signed license key.
               </p>
               <div className="license-machine-row">
                 <code>{licenseStatus?.machineId || "Waiting for backend..."}</code>
@@ -718,6 +1330,23 @@ export default function Home() {
                   <Copy className="h-4 w-4" />
                 </button>
               </div>
+              <label className="field-label">
+                <span>Company code for new key</span>
+                <input
+                  className="field-input"
+                  value={requestedCompanyCode}
+                  onChange={(event) => setRequestedCompanyCode(event.target.value)}
+                />
+              </label>
+              <button
+                className="btn-secondary flex items-center justify-center gap-2"
+                type="button"
+                disabled={!requestedCompanyCode.trim() || !licenseStatus?.machineId}
+                onClick={copyLicenseRequest}
+              >
+                <Copy className="h-4 w-4" />
+                Copy license request
+              </button>
               {(licenseError || licenseMessage) && (
                 <div className={licenseError ? "notice notice-error animate-pop" : "notice animate-pop"}>
                   {licenseError || licenseMessage}
@@ -780,300 +1409,117 @@ export default function Home() {
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-slate-100 text-slate-950 transition-colors duration-700 dark:bg-[#071016] dark:text-slate-50">
-      <div className="top-bar">
-          <img className="brand-logo" src="/company-logo.svg" alt="Vinfocom" />
-        </div>
+    <main className="app-shell relative min-h-screen text-slate-950 dark:text-slate-50">
+      <header className="app-header flex items-center justify-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
+        <div>
+                          <img className="header-brand-logo" src="/company-logo.svg" alt="Vinfocom" />
 
+           </div>
+        <div className="app-header-inner">
 
-      <div className="motion-grid" />
-      <div className="scanline" />
+          <div className="app-header-main">
 
-      <section className="relative z-10 mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6 lg:px-8">
-       
-        <header className="glass-panel animate-rise flex flex-col gap-5 p-5 sm:p-6 lg:flex-row lg:items-center lg:justify-between">
-          <div className="min-w-0">
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <span className="rounded-full border border-teal-300/40 bg-teal-500/10 px-3 py-1 text-xs font-black uppercase tracking-[0.24em] text-teal-800 shadow-sm transition-all duration-500 dark:text-teal-200">
-                Licensed until {formatExpiry(licenseStatus.expiresUtc)}
-              </span>
-              <button className="machine-id-button" type="button" onClick={() => setShowMachineId(true)}>
-                <KeyRound className="h-3.5 w-3.5" />
-                Machine ID
-              </button>
+            <div className="app-header-brand">
+              <span className="app-header-divider" aria-hidden="true" />
+              <h1>Indoor Report</h1>
             </div>
-            <h1 className="max-w-4xl text-4xl font-black leading-tight tracking-normal text-slate-950 transition-colors duration-500 dark:text-white sm:text-5xl">
-              Indoor Report
-            </h1>
-            <p className="mt-3 max-w-2xl text-sm font-medium leading-6 text-slate-600 transition-colors duration-500 dark:text-slate-300 sm:text-base">
-              Turn indoor survey ZIP logs into polished Excel reports with band discovery, floor grouping.     </p>
-          </div>
 
-          <div className="flex flex-col gap-3 sm:flex-row lg:items-center">
-            <div className="stats-card">
-              <span className="text-xs font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                Files
-              </span>
-              <strong className="text-2xl font-black">{reportFiles.length}</strong>
-            </div>
-            <div className="stats-card">
-              <span className="text-xs font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                Bands
-              </span>
-              <strong className="text-2xl font-black">{selectedBandNames.length}</strong>
-            </div>
-            <button
-              className="theme-toggle group"
-              type="button"
-              aria-label="Toggle theme"
-              onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
-            >
-              <span className="theme-toggle-track">
-                <span className={theme === "dark" ? "theme-toggle-dot translate-x-7" : "theme-toggle-dot"} />
-              </span>
-              <span className="flex items-center gap-2 text-sm font-black">
-                {theme === "dark" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
-                {theme === "dark" ? "Dark" : "Light"}
-              </span>
-            </button>
-          </div>
-        </header>
-
-        <section className="grid gap-5 lg:grid-cols-[minmax(0,1.06fr)_minmax(360px,0.94fr)]">
-          <div className="glass-panel animate-rise-delay p-4 sm:p-5">
-            <input
-              ref={inputRef}
-              type="file"
-              accept=".zip,application/zip,application/x-zip-compressed"
-              multiple
-              hidden
-              onChange={(event) => {
-                addFiles(event.target.files);
-                event.target.value = "";
-              }}
-            />
-
-            {reportFiles.length === 0 ? (
-              <div
-                className={`upload-zone group ${isDragActive ? "upload-zone-active" : ""}`}
-                onDragEnter={() => setIsDragActive(true)}
-                onDragLeave={() => setIsDragActive(false)}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsDragActive(false);
-                  addFiles(event.dataTransfer.files);
-                }}
-                onClick={() => inputRef.current?.click()}
-                role="button"
-                tabIndex={0}
-              >
-                <div className="upload-icon">
-                  <UploadCloud className="h-7 w-7 text-teal-700 transition-all duration-500 group-hover:-translate-y-1 dark:text-cyan-200" />
-                </div>
-                <div className="text-center">
-                  <strong className="block text-xl font-black text-slate-950 transition-colors duration-500 dark:text-white">
-                    Upload log ZIP files
-                  </strong>
-                  <span className="mt-2 block text-sm font-semibold text-slate-500 transition-colors duration-500 dark:text-slate-400">
-                    .zip, max {MAX_FILE_SIZE_LABEL} each
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div
-                className={`compact-upload ${isDragActive ? "compact-upload-active" : ""}`}
-                onDragEnter={() => setIsDragActive(true)}
-                onDragLeave={() => setIsDragActive(false)}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsDragActive(false);
-                  addFiles(event.dataTransfer.files);
-                }}
-              >
-                <div>
-                  <span className="text-xs font-black uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                    Uploaded ZIP files
-                  </span>
-                  <strong className="mt-1 block text-sm font-black">{reportFiles.length} selected</strong>
-                </div>
-                <button className="add-file-button" type="button" aria-label="Add ZIP files" onClick={() => inputRef.current?.click()}>
-                  <Plus className="h-5 w-5" />
-                </button>
-              </div>
-            )}
-
-            {reportFiles.length > 0 && (
-              <div className="mt-4 grid gap-3">
-                {reportFiles.map((file, index) => (
-                  <div className="glass-row group flex items-center gap-3" key={getReportFileKey(file)}>
-                    <button
-                      className="icon-action"
-                      aria-label={`Remove ${file.name}`}
-                      onClick={() => {
-                        setReportFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
-                        resetDiscovery();
-                      }}
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                    <FileArchive className="h-5 w-5 flex-none text-teal-700 dark:text-cyan-200" />
-                    <div className="min-w-0 flex-1">
-                      <strong className="block truncate text-sm font-black" title={file.name}>
-                        {file.name}
-                      </strong>
-                      <span className="text-xs font-semibold text-slate-500 transition-colors duration-500 dark:text-slate-400">
-                        {formatBytes(file.size)}
-                      </span>
-                    </div>
-                  </div>
+            <div className="app-header-actions">
+              <div className="mac-segment header-segment" role="tablist" aria-label="Report source mode">
+                {[
+                  ["offline", "Offline"],
+                  ["online", "Online"]
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    role="tab"
+                    aria-selected={appMode === value}
+                    disabled={isReportBusy}
+                    className={appMode === value ? "mac-segment-button mac-segment-button-active" : "mac-segment-button"}
+                    onClick={() => {
+                      if (appMode === value) return;
+                      setAppMode(value);
+                      resetDiscovery();
+                      if (value === "online") handleFetchRemoteSessions();
+                    }}
+                  >
+                    {label}
+                  </button>
                 ))}
               </div>
-            )}
+              <button
+                className="header-theme-button"
+                type="button"
+                aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                title={theme === "dark" ? "Light mode" : "Dark mode"}
+                onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
+              >
+                {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+              </button>
+            </div>
           </div>
 
-          <div className="glass-panel animate-rise-delay-2 p-4 sm:p-5">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <label className="field-label">
-                <span>Report Title</span>
-                <input className="field-input" value={reportTitle} onChange={(event) => setReportTitle(event.target.value)} />
-              </label>
-              <label className="field-label">
-                <span>Report Type</span>
-                <select
-                  className="field-input"
-                  value={reportType}
-                  onChange={(event) => {
-                    setReportType(event.target.value);
-                    setReportMode("separate");
-                    resetDiscovery();
-                  }}
-                >
-                  <option value="excel">Excel</option>
-                </select>
-              </label>
-            </div>
-
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              {reportType === "excel" && (
-                <div className="field-label sm:col-span-2">
-                  <span>Report Mode</span>
-                  <div className="mac-segment" role="tablist" aria-label="Report mode">
-                    {[
-                      ["separate", "Separate"],
-                      ["combined", "Combined"]
-                    ].map(([value, label]) => (
-                      <button
-                        key={value}
-                        type="button"
-                        role="tab"
-                        aria-selected={reportMode === value}
-                        className={reportMode === value ? "mac-segment-button mac-segment-button-active" : "mac-segment-button"}
-                        onClick={() => setReportMode(value)}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <label className="glass-check">
-                <input
-                  type="checkbox"
-                  checked={filterByImageName}
-                  onChange={(event) => {
-                    setFilterByImageName(event.target.checked);
-                    resetDiscovery();
-                  }}
-                />
-                <span>Filter by image name</span>
-              </label>
-              <label className="glass-check">
-                <input
-                  type="checkbox"
-                  checked={showSampleCount}
-                  onChange={(event) => setShowSampleCount(event.target.checked)}
-                />
-                <span>Show sample count</span>
-              </label>
-            </div>
-
-            {reportType === "excel" && reportMode === "combined" && reportFiles.length > 0 && (
-              <div className="mt-4 grid max-h-72 gap-3 overflow-auto pr-1">
-                {reportFiles.map((file, index) => {
-                  const key = getReportFileKey(file);
-                  return (
-                    <div className="glass-row grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px_82px]" key={key}>
-                      <div className="min-w-0">
-                        <span className="text-xs font-black uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                          ZIP File
-                        </span>
-                        <strong className="mt-1 block truncate text-sm font-black" title={file.name}>
-                          {file.name}
-                        </strong>
-                      </div>
-                      <label className="field-label">
-                        <span>Sheet Name</span>
-                        <input
-                          className="field-input"
-                          value={reportSheetNames[key] || ""}
-                          onChange={(event) =>
-                            setReportSheetNames((prev) => ({ ...prev, [key]: event.target.value }))
-                          }
-                          placeholder={`Floor ${index + 1}`}
-                        />
-                      </label>
-                      <label className="field-label">
-                        <span>Group</span>
-                        <input
-                          className="field-input"
-                          value={reportFileGroups[key] ?? String(index + 1)}
-                          onChange={(event) =>
-                            setReportFileGroups((prev) => ({ ...prev, [key]: event.target.value }))
-                          }
-                        />
-                      </label>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {reportType === "excel" && (
-              <div className="mt-4">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <label className="field-label min-w-0">
-                    <span>KPI Plots</span>
-                    <strong className="text-sm font-black">{selectedPlotInputs.length} selected</strong>
-                  </label>
-                  <div className="flex gap-2">
-                    <button className="btn-ghost" type="button" onClick={() => setAllPlotInputs(true)}>
-                      Select all
-                    </button>
-                    <button className="btn-ghost" type="button" onClick={() => setAllPlotInputs(false)}>
-                      Clear
-                    </button>
-                  </div>
-                </div>
-                <div className="grid max-h-48 gap-2 overflow-auto pr-1 sm:grid-cols-2">
-                  {PLOT_INPUT_OPTIONS.map((option) => (
-                    <label className="glass-check min-w-0" key={option.value}>
-                      <input
-                        type="checkbox"
-                        checked={selectedPlotInputs.includes(option.value)}
-                        onChange={() => togglePlotInput(option.value)}
-                      />
-                      <span className="truncate" title={option.label}>
-                        {option.label}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            )}
+          <div className="app-header-meta">
+            <span title={licensedCompanyCode || "No company code"}>Company: {licensedCompanyCode || "-"}</span>
+            <span>Licensed until {formatExpiry(licenseStatus.expiresUtc)}</span>
+            <span>{appMode === "online" ? `${selectedRemoteLogs.length} drives selected` : `${reportFiles.length} files selected`}</span>
+            <button
+              className="header-machine-button"
+              type="button"
+              onClick={() => {
+                setLicenseError("");
+                setLicenseMessage("");
+                setRequestedCompanyCode(licensedCompanyCode || "");
+                setConfirmLicenseRemoval(false);
+                setShowMachineId(true);
+              }}
+            >
+              <KeyRound className="h-3.5 w-3.5" />
+              License
+            </button>
           </div>
-        </section>
+        </div>
+      </header>
+
+      <section className="relative z-10 mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6 lg:px-8">
+
+        {appMode === "offline" && workflowStep === "upload" ? (
+          <section className="w-full max-w-3xl">
+            {uploadPanel}
+            <div className="mt-4 flex justify-end">
+              <button
+                className="btn-primary flex w-full items-center justify-center gap-2 sm:w-auto"
+                type="button"
+                onClick={handleDiscoverBands}
+                disabled={isReportBusy || reportFiles.length === 0}
+              >
+                {discoverLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                {discoverLoading ? "Finding bands..." : "Find Bands"}
+              </button>
+            </div>
+          </section>
+        ) : appMode === "offline" ? (
+          <>
+            <section className="grid gap-5 lg:grid-cols-[minmax(0,0.92fr)_minmax(360px,1.08fr)]">
+              <div className="grid gap-5">
+                {uploadPanel}
+                {bandsPanel}
+              </div>
+              {reportOptionsPanel}
+            </section>
+          </>
+        ) : workflowStep === "upload" ? (
+          remoteLogsPanel
+        ) : (
+          <section className="grid gap-5 lg:grid-cols-[minmax(0,0.92fr)_minmax(360px,1.08fr)]">
+            <div className="grid gap-5">
+              {remoteLogsPanel}
+              {bandsPanel}
+            </div>
+            {reportOptionsPanel}
+          </section>
+        )}
 
         {(error || message) && (
           <div className={error ? "notice notice-error animate-pop" : "notice animate-pop"}>{error || message}</div>
@@ -1096,117 +1542,126 @@ export default function Home() {
           </section>
         )}
 
-        <section className="grid gap-3 sm:grid-cols-2">
-          <button
-            className="btn-secondary flex items-center justify-center gap-2"
-            onClick={handleDiscoverBands}
-            disabled={isReportBusy || reportFiles.length === 0}
-          >
-            {discoverLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-            {discoverLoading ? "Discovering bands..." : `Discover Bands for ${reportOption.label}`}
-          </button>
-          <button
-            className="btn-primary flex items-center justify-center gap-2"
-            onClick={handleGenerateReport}
-            disabled={isReportBusy || reportFiles.length === 0}
-          >
-            {generateLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
-            {generateLoading ? "Generating report..." : `Generate ${reportOption.label} Report`}
-          </button>
-        </section>
-
-        {discoveredBands.length > 0 && (
-          <section className="glass-panel animate-rise p-4 sm:p-5">
-            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h2 className="text-xl font-black">Discovered File Bands</h2>
-                <span className="text-sm font-bold text-slate-500 transition-colors duration-500 dark:text-slate-400">
-                  {selectedBandNames.length} selected
-                </span>
-              </div>
-              <div className="flex gap-2">
-                <button className="btn-ghost" onClick={() => setAllFileBands(true)}>
-                  Select all
-                </button>
-                <button className="btn-ghost" onClick={() => setAllFileBands(false)}>
-                  Clear
-                </button>
-              </div>
-            </div>
-
-            <div className="grid max-h-[420px] gap-3 overflow-auto pr-1 md:grid-cols-2">
-              {discoveredBands.map((band, index) => {
-                const files =
-                  Array.isArray(band.Files) && band.Files.length > 0
-                    ? band.Files
-                    : [{ FileName: "All Files", Count: band.Count, Percentage: band.Percentage }];
-
-                return (
-                  <div className="band-card group" key={`${band.Band}-${index}`}>
-                    <div className="flex items-start justify-between gap-3">
-                      <strong className="text-base font-black">{band.Band}</strong>
-                      <span className="rounded-full border border-white/50 bg-white/30 px-2 py-1 text-xs font-black text-slate-600 backdrop-blur transition-all duration-500 dark:border-white/10 dark:bg-white/10 dark:text-slate-300">
-                        {band.Count !== null ? `${band.Count} rows` : "Band"}
-                        {band.Percentage !== null ? ` ${band.Percentage}%` : ""}
-                      </span>
-                    </div>
-                    <div className="mt-3 grid gap-2">
-                      {files.map((fileBand, fileIndex) => {
-                        const key = getFileBandKey(fileBand.FileName, band.Band);
-                        return (
-                          <label className="glass-check min-w-0" key={`${key}-${fileIndex}`}>
-                            <input
-                              type="checkbox"
-                              checked={Boolean(selectedFileBands[key])}
-                              onChange={() =>
-                                setSelectedFileBands((prev) => ({
-                                  ...prev,
-                                  [key]: !prev[key]
-                                }))
-                              }
-                            />
-                            <span className="truncate" title={fileBand.FileName}>
-                              {fileBand.FileName}: {fileBand.Count ?? 0}
-                              {fileBand.Percentage !== null ? ` (${fileBand.Percentage}%)` : ""}
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+        {workflowStep === "configure" && (
+          <section className="grid gap-3 sm:grid-cols-[180px_1fr]">
+            <button
+              className="btn-secondary flex items-center justify-center gap-2"
+              type="button"
+              onClick={() => setWorkflowStep("upload")}
+              disabled={isReportBusy}
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+            <button
+              className="btn-primary flex items-center justify-center gap-2"
+              type="button"
+              onClick={handleGenerateReport}
+              disabled={isReportBusy || activeReportFiles.length === 0}
+            >
+              {generateLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
+              {generateLoading ? "Generating report..." : `Generate ${reportOption.label} Report`}
+            </button>
           </section>
         )}
       </section>
 
       {showMachineId && (
-        <div className="modal-shell animate-pop" role="dialog" aria-modal="true" aria-label="Machine ID">
-          <div className="modal-backdrop" onClick={() => setShowMachineId(false)} />
+        <div className="modal-shell animate-pop" role="dialog" aria-modal="true" aria-label="License">
+          <div className="modal-backdrop" onClick={() => {
+            if (!licenseSaving && !licenseRemoving) setShowMachineId(false);
+          }} />
           <section className="modal-panel glass-panel">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-xl font-black">Machine ID</h2>
+                <h2 className="text-xl font-black">License</h2>
                 <p className="mt-1 text-sm font-semibold text-slate-600 dark:text-slate-300">
-                  Use this ID when issuing or renewing an Indoor Report license.
+                  Company code: {licensedCompanyCode || "Not set in the current key"}
                 </p>
               </div>
-              <button className="icon-action" type="button" aria-label="Close" onClick={() => setShowMachineId(false)}>
+              <button
+                className="icon-action"
+                type="button"
+                aria-label="Close"
+                disabled={licenseSaving || licenseRemoving}
+                onClick={() => setShowMachineId(false)}
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
+            <p className="mt-4 text-sm font-medium leading-6 text-slate-600 dark:text-slate-300">
+              Issue a new key in the license generator with your company code and this Machine ID.
+            </p>
+            <label className="field-label mt-4">
+              <span>Company code for new key</span>
+              <input
+                className="field-input"
+                value={requestedCompanyCode}
+                onChange={(event) => setRequestedCompanyCode(event.target.value)}
+              />
+            </label>
             <div className="mt-4 license-machine-row">
               <code>{licenseStatus?.machineId || "Unavailable"}</code>
-              <button className="icon-action" type="button" aria-label="Copy Machine ID" onClick={copyMachineId}>
+              <button className="icon-action" type="button" aria-label="Copy Machine ID" title="Copy Machine ID" onClick={copyMachineId}>
                 <Copy className="h-4 w-4" />
               </button>
             </div>
-
-            <button className="btn-primary mt-4 w-full" type="button" onClick={copyMachineId}>
-              Copy Machine ID
+            <button
+              className="btn-secondary mt-3 flex w-full items-center justify-center gap-2"
+              type="button"
+              disabled={!requestedCompanyCode.trim() || !licenseStatus?.machineId}
+              onClick={copyLicenseRequest}
+            >
+              <Copy className="h-4 w-4" />
+              Copy license request
             </button>
+
+            <form className="mt-5 grid gap-3" onSubmit={handleActivateLicense}>
+              <label className="field-label">
+                <span>New license key</span>
+                <textarea
+                  className="field-input license-key-input"
+                  value={licenseKey}
+                  onChange={(event) => setLicenseKey(event.target.value)}
+                  placeholder="Paste the newly issued key"
+                />
+              </label>
+              <button className="btn-primary" type="submit" disabled={licenseSaving || licenseRemoving || isReportBusy || !licenseKey.trim()}>
+                {licenseSaving ? "Activating..." : "Activate new key"}
+              </button>
+            </form>
+
+            {(licenseError || licenseMessage) && (
+              <div className={licenseError ? "notice notice-error mt-4" : "notice mt-4"}>
+                {licenseError || licenseMessage}
+              </div>
+            )}
+
+            {confirmLicenseRemoval ? (
+              <div className="mt-5 border-t border-slate-300/60 pt-4 dark:border-white/10">
+                <p className="text-sm font-medium text-slate-600 dark:text-slate-300">
+                  Delete the saved key? Reports will be unavailable until a new key is activated.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button className="btn-secondary" type="button" disabled={licenseRemoving || licenseSaving} onClick={() => setConfirmLicenseRemoval(false)}>
+                    Cancel
+                  </button>
+                  <button className="license-remove-button" type="button" disabled={licenseRemoving || licenseSaving || isReportBusy} onClick={handleRemoveLicense}>
+                    {licenseRemoving ? "Removing..." : "Delete current key"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                className="license-remove-link mt-5"
+                type="button"
+                disabled={licenseSaving || licenseRemoving || isReportBusy}
+                onClick={() => setConfirmLicenseRemoval(true)}
+              >
+                Delete current key
+              </button>
+            )}
           </section>
         </div>
       )}
