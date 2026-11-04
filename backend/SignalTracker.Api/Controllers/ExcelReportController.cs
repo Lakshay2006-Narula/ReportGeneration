@@ -1041,6 +1041,11 @@ namespace SignalTracker.Controllers
                 ReportProgressTracker.Complete(jobId, filename, bytes: bytes);
                 return File(bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename);
             }
+            catch (InvalidDataException ex)
+            {
+                ReportProgressTracker.Fail(jobId, ex.Message);
+                return BadRequest(new { Message = ex.Message });
+            }
             catch (Exception ex)
             {
                 ReportProgressTracker.Fail(jobId, ex.Message);
@@ -1196,6 +1201,10 @@ namespace SignalTracker.Controllers
                     AvailableBands = bandSummary,
                     BandsByFile    = bandsByFile
                 });
+            }
+            catch (InvalidDataException ex)
+            {
+                return BadRequest(new { Message = ex.Message });
             }
             finally
             {

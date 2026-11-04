@@ -30,20 +30,23 @@ public partial class ExcelReportController
 
     private void ValidateCaptureType(List<WalkTestLogRow> rows, string? captureType, string? jobId = null)
     {
+        if (rows.Count > 0 && !string.IsNullOrWhiteSpace(captureType) && !captureType.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var wifi = captureType.Equals("wifi", StringComparison.OrdinalIgnoreCase);
+            if (!wifi && !captureType.Equals("cellular", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Capture type must be Wi-Fi or Cellular.");
+            if (rows.Any(r => r.IsWifi != wifi))
+                throw new InvalidDataException(wifi
+                    ? "This log file is for cellular data, not Wi-Fi. Select the Cellular option and upload a cellular log, or upload a Wi-Fi log here."
+                    : "This log file is for Wi-Fi, not cellular data. Select the Wi-Fi option to use this file, or upload a cellular log here.");
+        }
+
         // Inspect actual rows before request filters: omitted/auto/mislabeled input cannot bypass licensing.
         if (rows.Any(r => r.IsWifi)) RequireReportFeature("wifi");
         if (rows.Any(r => !r.IsWifi)) RequireReportFeature("cellular");
         if (jobId != null && SignalTracker.Services.ReportProgressTracker.Get(jobId) is { } job)
             job.RequiredFeatures = job.RequiredFeatures
                 .Union(rows.Select(r => r.IsWifi ? "wifi" : "cellular")).ToArray();
-        if (rows.Count == 0 || string.IsNullOrWhiteSpace(captureType) || captureType.Equals("auto", StringComparison.OrdinalIgnoreCase)) return;
-        var wifi = captureType.Equals("wifi", StringComparison.OrdinalIgnoreCase);
-        if (!wifi && !captureType.Equals("cellular", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("Capture type must be Wi-Fi or Cellular.");
-        if (rows.Any(r => r.IsWifi != wifi))
-            throw new InvalidDataException(wifi
-                ? "This ZIP contains cellular data. Select Cellular to generate its report."
-                : "This ZIP contains Wi-Fi data. Select Wi-Fi to generate its report.");
     }
 
     private static ZipArchiveEntry? FindWifiPlot(ZipArchive archive)
