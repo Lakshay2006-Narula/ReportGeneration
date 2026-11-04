@@ -85,7 +85,20 @@ app.Use(async (context, next) =>
         }
     }
 
-    await next();
+    try
+    {
+        await next();
+    }
+    catch (LicenseFeatureException ex) when (!context.Response.HasStarted)
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsJsonAsync(new
+        {
+            code = "LICENSE_FEATURE_REQUIRED",
+            feature = ex.CaptureType,
+            message = ex.Message
+        });
+    }
 });
 
 app.MapControllers();

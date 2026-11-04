@@ -3,13 +3,19 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>STracerLicenseGenerator</AssemblyName>
-    <ApplicationIcon>..\..\build\icon.ico</ApplicationIcon>
+    <ApplicationIcon>..\..\src-tauri\icons\icon.ico</ApplicationIcon>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
-  <ItemGroup Condition="Exists('..\..\license-keys\private-key.txt')">
-    <EmbeddedResource Include="..\..\license-keys\private-key.txt" LogicalName="private-key.txt" />
-  </ItemGroup>
+  <!-- Signing keys must remain external to the generator binary. -->
+  <Target Name="RejectEmbeddedSigningKey" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <SigningKeyResource Include="@(EmbeddedResource)"
+        Condition="'%(EmbeddedResource.Filename)%(EmbeddedResource.Extension)' == 'private-key.txt' Or '%(EmbeddedResource.LogicalName)' == 'private-key.txt'" />
+    </ItemGroup>
+    <Error Condition="'@(SigningKeyResource)' != ''"
+      Text="Private signing keys must never be embedded in the license generator." />
+  </Target>
 </Project>

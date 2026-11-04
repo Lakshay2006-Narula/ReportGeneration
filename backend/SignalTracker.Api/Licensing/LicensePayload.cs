@@ -17,6 +17,10 @@ namespace SignalTracker.Licensing
         [JsonPropertyName("cc")]
         public string? CompanyCode { get; set; }
 
+        // Signed report entitlements: "cellular", "wifi", or both.
+        [JsonPropertyName("features")]
+        public string[]? Features { get; set; }
+
         [JsonPropertyName("iat")]
         public string? IssuedUtc { get; set; }
 

@@ -11,6 +11,7 @@ namespace SignalTracker.Services
         public bool IsCompleted { get; set; }
         public bool IsFailed { get; set; }
         public bool IsProcessing => !IsCompleted && !IsFailed;
+        public string[] RequiredFeatures { get; set; } = Array.Empty<string>();
         public string? Error { get; set; }
         public string? FileName { get; set; }
         public string? DownloadPath { get; set; }

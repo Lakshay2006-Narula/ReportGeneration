@@ -10,6 +10,15 @@ namespace SignalTracker.Controllers
     [ApiController]
     public sealed class RemoteSessionsController : ControllerBase
     {
+        private const string WifiDataSql = """
+                    (LOWER(REPLACE(TRIM(COALESCE(s.`type`, '')), '-', '')) = 'wifi'
+                     OR EXISTS (
+                         SELECT 1 FROM `tbl_network_log` n
+                         WHERE n.`session_id` = s.`id`
+                           AND UPPER(REPLACE(REPLACE(COALESCE(n.`network`, ''), '-', ''), ' ', '')) = 'WIFI'
+                     ))
+                    """;
+
         private const int MaximumPageSize = 200;
         private const long MaximumZipBytes = 500L * 1024 * 1024;
 
@@ -37,6 +46,7 @@ namespace SignalTracker.Controllers
             [FromQuery] long? userId,
             [FromQuery] int page = 1,
             [FromQuery] int pageSize = 100,
+            [FromQuery] string? captureType = null,
             CancellationToken cancellationToken = default)
         {
             if ((companyId.HasValue && companyId <= 0) || (userId.HasValue && userId <= 0))
@@ -51,6 +61,22 @@ namespace SignalTracker.Controllers
                 {
                     message = $"pageSize must be between 1 and {MaximumPageSize}."
                 });
+            }
+
+            var selectedCapture = (captureType ?? "all").Trim().ToLowerInvariant();
+            if (selectedCapture != "all" && selectedCapture != "wifi" && selectedCapture != "cellular")
+                return BadRequest(new { message = "captureType must be wifi, cellular, or all." });
+
+            if (_configuration.GetValue("License:Enforce", false))
+            {
+                if (selectedCapture == "all")
+                {
+                    var wifi = _licenseService.AllowsReport("wifi");
+                    var cellular = _licenseService.AllowsReport("cellular");
+                    if (!wifi && !cellular) _licenseService.RequireReport("cellular");
+                    if (!wifi || !cellular) selectedCapture = wifi ? "wifi" : "cellular";
+                }
+                else _licenseService.RequireReport(selectedCapture);
             }
 
             var connectionString = _configuration.GetConnectionString("MySqlConnection");
@@ -88,12 +114,22 @@ namespace SignalTracker.Controllers
                 await using var connection = new MySqlConnection(connectionString);
                 await connection.OpenAsync(cancellationToken);
 
-                var userFilter = userId.HasValue ? " AND `user_id` = @userId" : "";
+                var userFilter = userId.HasValue ? " AND s.`user_id` = @userId" : "";
+                // Legacy Wi-Fi ZIP sessions can be marked as wifi before their plot rows are imported.
+                var captureFilter = selectedCapture == "wifi" ? $" AND {WifiDataSql}"
+                    : selectedCapture == "cellular" ? $" AND NOT {WifiDataSql}" : "";
+                // The live schema stores the image-plot flag on tbl_session.extra_json.
+                // Filter before pagination so only qualifying sessions are listed.
                 var sql = $"""
-                    SELECT `id`, `company_id`, `user_id`
-                    FROM `tbl_session`
-                    WHERE `company_id` = @companyId{userFilter}
-                    ORDER BY `id` DESC
+                    SELECT s.`id`, s.`company_id`, s.`user_id`, {WifiDataSql} AS has_wifi_data
+                    FROM `tbl_session` s
+                    WHERE s.`company_id` = @companyId{userFilter}
+                      AND CASE
+                          WHEN JSON_VALID(s.`extra_json`) THEN
+                              JSON_UNQUOTE(JSON_EXTRACT(s.`extra_json`, '$.imageplot'))
+                          ELSE NULL
+                      END = '1'{captureFilter}
+                    ORDER BY s.`id` DESC
                     LIMIT @pageSize OFFSET @offset;
                     """;
 
@@ -112,6 +148,7 @@ namespace SignalTracker.Controllers
                     sessions.Add(new RemoteSessionResponse
                     {
                         LogId = logId,
+                        CaptureType = reader.GetBoolean("has_wifi_data") ? "wifi" : "cellular",
                         CompanyId = reader.IsDBNull(companyIdOrdinal) ? null : reader.GetInt64(companyIdOrdinal),
                         UserId = reader.IsDBNull(userIdOrdinal) ? null : reader.GetInt64(userIdOrdinal),
                         FileName = $"log_{logId}.zip",
@@ -124,6 +161,7 @@ namespace SignalTracker.Controllers
 
                 return Ok(new
                 {
+                    captureType = selectedCapture,
                     companyId = licensedCompanyId,
                     companyCode = _licenseService.GetStatus().CompanyCode,
                     userId,
@@ -179,12 +217,15 @@ namespace SignalTracker.Controllers
                 {
                     await connection.OpenAsync(cancellationToken);
                     await using var command = new MySqlCommand(
-                        "SELECT 1 FROM `tbl_session` WHERE `id` = @logId AND `company_id` = @companyId LIMIT 1;",
+                        $"SELECT {WifiDataSql} FROM `tbl_session` s WHERE s.`id` = @logId AND s.`company_id` = @companyId LIMIT 1;",
                         connection);
                     command.Parameters.AddWithValue("@logId", logId);
                     command.Parameters.AddWithValue("@companyId", companyId.Value);
-                    if (await command.ExecuteScalarAsync(cancellationToken) == null)
+                    var isWifi = await command.ExecuteScalarAsync(cancellationToken);
+                    if (isWifi == null)
                         return NotFound(new { message = "This log was not found for the licensed company." });
+                    if (_configuration.GetValue("License:Enforce", false))
+                        _licenseService.RequireReport(Convert.ToBoolean(isWifi) ? "wifi" : "cellular");
                 }
 
                 var url = urlTemplate.Replace("{logId}", logId.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal);
@@ -257,6 +298,7 @@ namespace SignalTracker.Controllers
         private sealed class RemoteSessionResponse
         {
             public long LogId { get; init; }
+            public required string CaptureType { get; init; }
             public long? CompanyId { get; init; }
             public long? UserId { get; init; }
             public required string FileName { get; init; }

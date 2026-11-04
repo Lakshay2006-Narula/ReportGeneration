@@ -7,6 +7,7 @@ namespace SignalTracker.Models
     /// </summary>
     public class ZipBandDiscoveryRequest
     {
+        public string? CaptureType { get; set; }
         public IFormFile? LogZip { get; set; }
         public List<IFormFile>? LogZips { get; set; }
         public long? SessionIdOverride { get; set; }

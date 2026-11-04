@@ -13,6 +13,7 @@ namespace SignalTracker.Licensing
         public long? CompanyId { get; set; }
         public string? CompanyCode { get; set; }
         public DateTime? ExpiresUtc { get; set; }
+        public string[] Features { get; set; } = Array.Empty<string>();
         public string? Error { get; set; }
     }
 
@@ -45,11 +46,26 @@ namespace SignalTracker.Licensing
         {
             lock (_lock)
             {
-                return _cachedStatus ??= LoadPersistedLicense();
+                var status = _cachedStatus ??= LoadPersistedLicense();
+                if (status.Activated && status.ExpiresUtc is DateTime expiry && expiry <= DateTime.UtcNow)
+                    return _cachedStatus = NotActivated("This license key has expired.");
+                return status;
             }
         }
 
         public bool IsActivated => GetStatus().Activated;
+
+        public bool AllowsReport(string captureType)
+        {
+            var status = GetStatus();
+            return status.Activated && status.Features.Contains(captureType, StringComparer.OrdinalIgnoreCase);
+        }
+
+        public void RequireReport(string captureType)
+        {
+            if (!AllowsReport(captureType))
+                throw new LicenseFeatureException(captureType);
+        }
 
         public LicenseStatus Activate(string licenseKey)
         {
@@ -253,9 +269,15 @@ namespace SignalTracker.Licensing
                 LicensedTo = payload.LicensedTo,
                 CompanyId = payload.CompanyId,
                 CompanyCode = payload.CompanyCode,
+                Features = ResolveReportFeatures(payload),
                 ExpiresUtc = expiresUtc
             };
         }
+
+        // Existing signed keys predate Wi-Fi reports and retain Cellular access only.
+        private static string[] ResolveReportFeatures(LicensePayload payload) =>
+            (payload.Features ?? new[] { "cellular" })
+                .Where(f => f is "cellular" or "wifi").Distinct().ToArray();
 
         private static byte[] Base64UrlDecode(string input)
         {

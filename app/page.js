@@ -53,6 +53,15 @@ const PLOT_INPUT_OPTIONS = [
   { value: "PUSCH_TX", label: "PUSCH TX" }
 ];
 
+const WIFI_PLOT_INPUT_OPTIONS = [
+  { value: "BAND", label: "Wi-Fi Band" },
+  { value: "WIFI_RSSI", label: "Wi-Fi RSSI" },
+  { value: "LINK_SPEED", label: "Link Speed" },
+  { value: "CHANNEL", label: "Channel" },
+  { value: "DL_THPT", label: "DL Throughput" },
+  { value: "UL_THPT", label: "UL Throughput" }
+];
+
 const toSafeArray = (value) => {
   if (Array.isArray(value)) return value;
   if (Array.isArray(value?.Data)) return value.Data;
@@ -364,6 +373,7 @@ const formatExpiry = (value) => {
 
 export default function Home() {
   const inputRef = useRef(null);
+  const remoteFetchId = useRef(0);
   const [theme, setTheme] = useState("light");
   const [licenseStatus, setLicenseStatus] = useState(null);
   const [licenseKey, setLicenseKey] = useState("");
@@ -376,6 +386,7 @@ export default function Home() {
   const [showMachineId, setShowMachineId] = useState(false);
   const [confirmLicenseRemoval, setConfirmLicenseRemoval] = useState(false);
   const [appMode, setAppMode] = useState("offline");
+  const [captureType, setCaptureType] = useState("cellular");
   const [licenseStep, setLicenseStep] = useState(1);
   const [workflowStep, setWorkflowStep] = useState("upload");
   const [isDragActive, setIsDragActive] = useState(false);
@@ -403,9 +414,13 @@ export default function Home() {
   const [error, setError] = useState("");
 
   const reportOption = REPORT_TYPE_OPTIONS[reportType] || REPORT_TYPE_OPTIONS.excel;
+  const plotInputOptions = captureType === "wifi" ? WIFI_PLOT_INPUT_OPTIONS : PLOT_INPUT_OPTIONS;
+  const licensedFeatures = licenseStatus?.features ?? [];
+  const canUseCapture = (value) => licensedFeatures.includes(value);
+  const captureLabel = captureType === "wifi" ? "Wi-Fi" : "Cellular";
   const isReportBusy = discoverLoading || generateLoading || remoteLoading || remoteDownloading;
   const licensedCompanyCode = licenseStatus?.companyCode ?? licenseStatus?.CompanyCode ?? "";
-  const activeReportFiles = appMode === "online" ? downloadedRemoteFiles : reportFiles;
+  const activeReportFiles = !canUseCapture(captureType) ? [] : appMode === "online" ? downloadedRemoteFiles : reportFiles;
   const selectedRemoteLogs = useMemo(
     () => remoteSessions.filter((session) => selectedRemoteLogIds[String(session.LogId ?? session.logId)]),
     [remoteSessions, selectedRemoteLogIds]
@@ -452,6 +467,21 @@ export default function Home() {
     const systemDark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches;
     setTheme(savedTheme || (systemDark ? "dark" : "light"));
   }, []);
+
+  useEffect(() => {
+    if (!licenseStatus?.activated) return;
+    const features = licenseStatus.features ?? [];
+    const nextType = features.includes(captureType) ? captureType : features[0];
+    ++remoteFetchId.current;
+    setRemoteSessions([]);
+    setSelectedRemoteLogIds({});
+    setDownloadedRemoteFiles([]);
+    resetDiscovery();
+    if (nextType && nextType !== captureType) {
+      setCaptureType(nextType);
+      setSelectedPlotInputs((nextType === "wifi" ? WIFI_PLOT_INPUT_OPTIONS : PLOT_INPUT_OPTIONS).map((option) => option.value));
+    }
+  }, [licenseStatus, resetDiscovery]);
 
   useEffect(() => {
     refreshLicenseStatus();
@@ -536,6 +566,7 @@ export default function Home() {
       const formData = new FormData();
       activeReportFiles.forEach((file) => formData.append(reportOption.fileField, file));
       formData.append("FilterByImageName", "true");
+      formData.append("CaptureType", captureType);
 
       const response = await postFormJson(reportOption.discoverPath, formData);
       const bandsList = normalizeDiscoveredBands(
@@ -574,7 +605,13 @@ export default function Home() {
     }
   };
 
-  const handleFetchRemoteSessions = async () => {
+  const handleFetchRemoteSessions = async (typeOverride) => {
+    const targetType = typeof typeOverride === "string" ? typeOverride : captureType;
+    if (!canUseCapture(targetType)) {
+      setError("This report type is not included in your license.");
+      return;
+    }
+    const fetchId = ++remoteFetchId.current;
     if (!licensedCompanyCode) {
       setError("This license does not include a company code.");
       return;
@@ -593,19 +630,21 @@ export default function Home() {
       const sessions = [];
       const pageSize = 200;
       for (let page = 1; ; page += 1) {
-        const response = await getJson(`/api/RemoteSessions?page=${page}&pageSize=${pageSize}`);
+        const response = await getJson(`/api/RemoteSessions?captureType=${encodeURIComponent(targetType)}&page=${page}&pageSize=${pageSize}`);
+        if (fetchId !== remoteFetchId.current) return;
         const batch = Array.isArray(response?.sessions) ? response.sessions : response?.Sessions;
         if (!Array.isArray(batch)) throw new Error("Remote session response is invalid.");
         sessions.push(...batch);
         if (batch.length < pageSize) break;
       }
 
+      if (fetchId !== remoteFetchId.current) return;
       setRemoteSessions(sessions);
-      if (!sessions.length) setMessage("No remote sessions found for this company.");
+      if (!sessions.length) setMessage(`No ${targetType === "wifi" ? "Wi-Fi" : "cellular"} image-plot sessions found for this company.`);
     } catch (err) {
-      setError(err?.message || "Failed to load remote logs.");
+      if (fetchId === remoteFetchId.current) setError(err?.message || "Failed to load remote logs.");
     } finally {
-      setRemoteLoading(false);
+      if (fetchId === remoteFetchId.current) setRemoteLoading(false);
     }
   };
 
@@ -685,6 +724,7 @@ export default function Home() {
       formData.append("Title", reportTitle || "");
       formData.append("ProjectName", reportTitle || "");
       formData.append("FilterByImageName", "true");
+      formData.append("CaptureType", captureType);
       formData.append("ShowSampleCount", String(showSampleCount));
       selectedPlotInputs.forEach((plotInput) => formData.append("PlotInputs", plotInput));
 
@@ -767,7 +807,7 @@ export default function Home() {
   };
 
   const setAllPlotInputs = (checked) => {
-    setSelectedPlotInputs(checked ? PLOT_INPUT_OPTIONS.map((option) => option.value) : []);
+    setSelectedPlotInputs(checked ? plotInputOptions.map((option) => option.value) : []);
   };
 
   const togglePlotInput = (value) => {
@@ -1058,7 +1098,7 @@ export default function Home() {
             </div>
           </div>
           <div className="grid max-h-48 gap-2 overflow-auto pr-1 sm:grid-cols-2">
-            {PLOT_INPUT_OPTIONS.map((option) => (
+            {plotInputOptions.map((option) => (
               <label className="glass-check min-w-0" key={option.value}>
                 <input
                   type="checkbox"
@@ -1151,7 +1191,7 @@ export default function Home() {
     <section className="glass-panel animate-rise p-4 sm:p-5">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-black">Remote Drives</h2>
+          <h2 className="text-xl font-black">{captureLabel} Sessions</h2>
           <span className="text-sm font-bold text-slate-500 dark:text-slate-400">
             {selectedRemoteLogs.length} selected
             {workflowStep === "upload" && ` of ${remoteSessions.length}`}
@@ -1186,8 +1226,8 @@ export default function Home() {
             <button
               className="header-theme-button"
               type="button"
-              aria-label="Refresh remote drives"
-              title="Refresh remote drives"
+              aria-label="Refresh remote sessions"
+              title="Refresh remote sessions"
               disabled={isReportBusy || !licensedCompanyCode}
               onClick={handleFetchRemoteSessions}
             >
@@ -1225,10 +1265,10 @@ export default function Home() {
 
       {remoteLoading ? (
         <div className="flex items-center gap-2 py-6 text-sm font-semibold text-slate-600 dark:text-slate-300">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading drives...
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading sessions...
         </div>
       ) : remoteSessions.length === 0 ? (
-        <p className="py-6 text-sm font-medium text-slate-600 dark:text-slate-300">No drives available.</p>
+        <p className="py-6 text-sm font-medium text-slate-600 dark:text-slate-300">{`No ${captureLabel} sessions available.`}</p>
       ) : visibleRemoteSessions.length === 0 ? (
         <p className="py-6 text-sm font-medium text-slate-600 dark:text-slate-300">
           {workflowStep === "configure" ? "No sessions selected." : "No sessions match your search."}
@@ -1250,7 +1290,7 @@ export default function Home() {
                   }))}
                 />
                 <span className="min-w-0 flex-1">
-                  <strong className="block truncate text-sm" title={`Drive ${logId}`}>Drive {logId}</strong>
+                  <strong className="block truncate text-sm" title={`${captureLabel} session ${logId}`}>{captureLabel} {logId}</strong>
                   <span className="block truncate text-xs font-medium text-slate-500 dark:text-slate-400">
                     log_{logId}.zip{userId ? ` - User ${userId}` : ""}
                   </span>
@@ -1421,10 +1461,38 @@ export default function Home() {
 
             <div className="app-header-brand">
               <span className="app-header-divider" aria-hidden="true" />
-              <h1>Indoor Report</h1>
+              <h1>{captureLabel} Indoor Report</h1>
             </div>
 
             <div className="app-header-actions">
+              <div className="mac-segment header-segment" role="tablist" aria-label="Network report type">
+                {[["cellular", "Cellular"], ["wifi", "Wi-Fi"]].map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    role="tab"
+                    aria-selected={captureType === value}
+                    disabled={isReportBusy || !canUseCapture(value)}
+                    title={canUseCapture(value) ? label : `${label} reports are not included in your license`}
+                    className={captureType === value ? "mac-segment-button mac-segment-button-active" : "mac-segment-button"}
+                    onClick={() => {
+                      if (captureType === value || !canUseCapture(value)) return;
+                      ++remoteFetchId.current;
+                      setCaptureType(value);
+                      setSelectedPlotInputs((value === "wifi" ? WIFI_PLOT_INPUT_OPTIONS : PLOT_INPUT_OPTIONS).map((option) => option.value));
+                      setRemoteSessions([]);
+                      setSelectedRemoteLogIds({});
+                      setDownloadedRemoteFiles([]);
+                      setSessionSearch("");
+                      setWorkflowStep("upload");
+                      resetDiscovery();
+                      if (appMode === "online") handleFetchRemoteSessions(value);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               <div className="mac-segment header-segment" role="tablist" aria-label="Report source mode">
                 {[
                   ["offline", "Offline"],
@@ -1463,7 +1531,8 @@ export default function Home() {
           <div className="app-header-meta">
             <span title={licensedCompanyCode || "No company code"}>Company: {licensedCompanyCode || "-"}</span>
             <span>Licensed until {formatExpiry(licenseStatus.expiresUtc)}</span>
-            <span>{appMode === "online" ? `${selectedRemoteLogs.length} drives selected` : `${reportFiles.length} files selected`}</span>
+            <span>Reports: {licensedFeatures.map(value => value === "wifi" ? "Wi-Fi" : "Cellular").join(", ") || "None"}</span>
+            <span>{appMode === "online" ? `${selectedRemoteLogs.length} sessions selected` : `${reportFiles.length} files selected`}</span>
             <button
               className="header-machine-button"
               type="button"
@@ -1560,7 +1629,7 @@ export default function Home() {
               disabled={isReportBusy || activeReportFiles.length === 0}
             >
               {generateLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
-              {generateLoading ? "Generating report..." : `Generate ${reportOption.label} Report`}
+              {generateLoading ? "Generating report..." : `Generate ${captureLabel} ${reportOption.label} Report`}
             </button>
           </section>
         )}

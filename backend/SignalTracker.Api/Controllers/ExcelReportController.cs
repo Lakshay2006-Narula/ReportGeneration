@@ -14,6 +14,7 @@ using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using SkiaSharp;
 using SignalTracker.Models;
+using SignalTracker.Licensing;
 using SignalTracker.Services;
 using System.Text.Json;
 
@@ -21,7 +22,7 @@ namespace SignalTracker.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class ExcelReportController : ControllerBase
+    public partial class ExcelReportController : ControllerBase
     {
         private const string ImageBaseUrl = "https://apistracer.vinfocom.co.in/uploaded_images";
         private static readonly HashSet<string> UniqueValueHeaders = new(StringComparer.OrdinalIgnoreCase)
@@ -93,15 +94,18 @@ namespace SignalTracker.Controllers
         private readonly ApplicationDbContext _db;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IConfiguration _configuration;
+        private readonly LicenseService _licenseService;
 
         public ExcelReportController(
             ApplicationDbContext db,
             IHttpClientFactory httpClientFactory,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            LicenseService licenseService)
         {
             _db = db;
             _httpClientFactory = httpClientFactory;
             _configuration = configuration;
+            _licenseService = licenseService;
         }
 
 
@@ -277,6 +281,8 @@ namespace SignalTracker.Controllers
             if (!item.IsCompleted)
                 return BadRequest(new { Message = "Report is not ready yet.", Status = item.Status, Progress = item.Progress });
 
+            foreach (var feature in item.RequiredFeatures) RequireReportFeature(feature);
+
             var filename = item.FileName ?? $"Walk_Test_Report_{jobId}.xlsx";
 
             if (item.FileBytes != null && item.FileBytes.Length > 0)
@@ -329,6 +335,9 @@ namespace SignalTracker.Controllers
                 var earfcnWise = ResolveEarfcnWise(request.EarfcnMode, request.EarfcnWise, Request.HasFormContentType ? Request.Form : null, Request.Query);
 
                 ReportProgressTracker.Update(jobId, 20, "Querying network logs from database...", 2);
+                // This endpoint is the legacy cellular database report path.
+                RequireReportFeature("cellular");
+                if (ReportProgressTracker.Get(jobId) is { } job) job.RequiredFeatures = new[] { "cellular" };
                 var rows = await QueryWalkTestRowsAsync(request, sessionIds, earfcnWise);
                 if (rows.Count == 0)
                 {
@@ -427,6 +436,7 @@ namespace SignalTracker.Controllers
             {
                 JobId = jobId,
                 ProjectName = request?.ProjectName,
+                CaptureType = request?.CaptureType,
                 Title = request?.Title,
                 SessionIdOverride = request?.SessionIdOverride,
                 BandFilter = request?.BandFilter,
@@ -526,6 +536,7 @@ namespace SignalTracker.Controllers
             var reportRequest = new ZipReportUploadRequest
             {
                 JobId = jobId,
+                CaptureType = request.CaptureType,
                 Title = request.Title,
                 ProjectName = string.IsNullOrWhiteSpace(request.ProjectName) ? request.Title : request.ProjectName,
                 BandFilter = request.BandFilter,
@@ -685,7 +696,7 @@ namespace SignalTracker.Controllers
                         RegexOptions.IgnoreCase);
 
                     return match.Success &&
-                           ImageHeaders.Contains(
+                           ImageHeaders.Union(WifiImageHeaders).Contains(
                                match.Groups["header"].Value,
                                StringComparer.OrdinalIgnoreCase);
                 });
@@ -718,7 +729,7 @@ namespace SignalTracker.Controllers
             return groups;
         }
 
-        private static async Task ProcessGenerateFromZipAsync(
+        private async Task ProcessGenerateFromZipAsync(
             string jobId,
             List<(string TempPath, string OriginalFileName)> tempFiles,
             ZipReportUploadRequest request,
@@ -765,6 +776,7 @@ namespace SignalTracker.Controllers
                 }
 
                 var zipRows = ExtractNetworkRowsFromZip(archive, sid, earfcnWise);
+                ValidateCaptureType(zipRows, request.CaptureType, jobId);
                 int assignedGroup = (zipIdx < fileGroups.Count) ? fileGroups[zipIdx] : (zipIdx + 1);
                 foreach (var r in zipRows)
                 {
@@ -935,6 +947,7 @@ namespace SignalTracker.Controllers
                     }
 
                     var zipRows = ExtractNetworkRowsFromZip(archive, sid, earfcnWise);
+                    ValidateCaptureType(zipRows, request?.CaptureType, jobId);
                     int assignedGroup = fileGroups[zipIdx];
                     foreach (var r in zipRows)
                     {
@@ -1091,6 +1104,7 @@ namespace SignalTracker.Controllers
                     if (sid > 0 && !sessionIds.Contains(sid)) sessionIds.Add(sid);
 
                     var zipRows = ExtractNetworkRowsFromZip(archive, sid, earfcnWise);
+                    ValidateCaptureType(zipRows, request.CaptureType);
                     string fileName = Path.GetFileNameWithoutExtension(upload.FileName);
                     foreach (var r in zipRows)
                     {
@@ -1306,7 +1320,7 @@ namespace SignalTracker.Controllers
                         images[$"MAP_{header}"] = bytes;
 
                     // Also extract known KPI suffix if header is compound (e.g. B3_RSRP, 1200_RSRP, map_B3_RSRP)
-                    foreach (var kpi in ImageHeaders)
+                    foreach (var kpi in ImageHeaders.Union(WifiImageHeaders))
                     {
                         var kpiUpper = kpi.ToUpperInvariant();
                         if (header.EndsWith($"_{kpiUpper}", StringComparison.OrdinalIgnoreCase) ||
@@ -1613,6 +1627,11 @@ namespace SignalTracker.Controllers
         {
             var rows = new List<WalkTestLogRow>();
             var nextId = 1;
+
+            var wifiPlot = FindWifiPlot(archive);
+            if (wifiPlot != null) return ExtractWifiRows(archive, wifiPlot, sessionId);
+            if (IsWifiCapture(archive))
+                throw new InvalidDataException("This Wi-Fi capture has no WiFi_plot.csv or Wi-Fi image_plot.csv. Export the original Wi-Fi plot log.");
 
             var imagePlotRows = ExtractRowsFromImagePlot(archive, sessionId, ref nextId, earfcnWise);
             if (imagePlotRows.Count > 0)
@@ -2051,7 +2070,11 @@ namespace SignalTracker.Controllers
                 r.Bler = NormalizeZipText(r.Bler);
 
                 // Re-resolve BandSheetName after Band/Network have been normalised
-                if (!earfcnWise)
+                if (r.IsWifi)
+                {
+                    r.BandSheetName = WifiBandName(r.Band);
+                }
+                else if (!earfcnWise)
                 {
                     // In without-earfcn mode, ALWAYS strip any earfcn compound or discrete earfcn numbers and resolve purely to Band (e.g. B3)
                     r.BandSheetName = ToBandSheetName(r.Band, r.Network, r.Earfcn, r.Primary, false);
@@ -2270,7 +2293,7 @@ namespace SignalTracker.Controllers
                 .Select(NormalizePlotInput)
                 .Where(x => x.Length > 0)
                 .Where(x => !x.Equals("ALL", StringComparison.OrdinalIgnoreCase))
-                .Where(x => ImageHeaders.Contains(x, StringComparer.OrdinalIgnoreCase))
+                .Where(x => ImageHeaders.Union(WifiImageHeaders).Contains(x, StringComparer.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
@@ -2536,6 +2559,11 @@ namespace SignalTracker.Controllers
 
                 if (rangesByMetric.Count == 0) return thresholds;
 
+                ApplyZipMetricRanges(rangesByMetric, "WIFI_RSSI", ranges => thresholds.WifiRssi = ranges);
+                ApplyZipMetricRanges(rangesByMetric, "WIFI_LINK", ranges => thresholds.WifiLinkSpeed = ranges);
+                ApplyZipMetricRanges(rangesByMetric, "LINK_SPEED", ranges => thresholds.WifiLinkSpeed = ranges);
+                ApplyZipMetricRanges(rangesByMetric, "WIFI_CHANNEL", ranges => thresholds.WifiChannel = ranges);
+                ApplyZipMetricRanges(rangesByMetric, "WIFI_BAND", ranges => thresholds.WifiBand = ranges);
                 ApplyZipMetricRanges(rangesByMetric, "RSRP", ranges => thresholds.Rsrp = ranges);
                 ApplyZipMetricRanges(rangesByMetric, "RSRQ", ranges => thresholds.Rsrq = ranges);
                 ApplyZipMetricRanges(rangesByMetric, "SINR", ranges => thresholds.Sinr = ranges);
@@ -2787,7 +2815,7 @@ namespace SignalTracker.Controllers
         {
             // Only fetch map plot images over HTTP (legends are created dynamically by the backend)
             var urls = sessionIds
-                .SelectMany(sessionId => ImageHeaders.Select(header => BuildImageUrl(sessionId, header)))
+                .SelectMany(sessionId => ImageHeaders.Union(WifiImageHeaders).Select(header => BuildImageUrl(sessionId, header)))
                 .Distinct()
                 .ToList();
 
@@ -3195,7 +3223,7 @@ namespace SignalTracker.Controllers
                             var sidList = sid > 0 ? new[] { sid } : null;
                             var candBands = groupRows.Select(x => x.Band).Where(b => !string.IsNullOrWhiteSpace(b)).Distinct().ToList();
 
-                            hasPng = ImageHeaders.Any(h =>
+                            hasPng = GetPlotHeaders(groupRows).Any(h =>
                                 TryResolveMapImage(imageBytesByUrl, sid, h,
                                                    bandName: null,
                                                    earfcns: groupRows.Select(x => x.Earfcn),
@@ -3267,9 +3295,7 @@ namespace SignalTracker.Controllers
             var workbook = new XlsxWorkbook();
             onProgress?.Invoke(50, "Generating Site Summary sheet...");
             workbook.Sheets.Add(BuildSiteSummarySheet(projectName, sessionIds, rows, siteRows));
-            var plotHeaders = selectedPlotInputs != null && selectedPlotInputs.Count > 0
-                ? ImageHeaders.Where(h => selectedPlotInputs.Contains(h, StringComparer.OrdinalIgnoreCase)).ToArray()
-                : ImageHeaders;
+            var plotHeaders = ResolveReportPlotHeaders(rows, selectedPlotInputs);
 
             var bandGroups = rows
                 .Where(x => !string.IsNullOrWhiteSpace(x.BandSheetName) &&
@@ -3688,7 +3714,7 @@ namespace SignalTracker.Controllers
             bool earfcnWise = true,
             IReadOnlyList<string>? plotHeaders = null)
         {
-            plotHeaders ??= ImageHeaders;
+            plotHeaders ??= GetPlotHeaders(allRows);
             int numBands = bandBlocks.Count;
             int totalCols = Math.Max(15, numBands * 9);
             var columnWidths = new double[totalCols];
@@ -3723,11 +3749,12 @@ namespace SignalTracker.Controllers
                 int fIdx = fileIndexes.Count == 1 ? fileIndexes[0] : -1;
                 string? sName = sourceFileNames.Count == 1 ? sourceFileNames[0] : null;
 
-                var plotSlots = new (string Header, byte[] FinalBytes, (int WidthEmu, int HeightEmu) Size)?[plotHeaders.Count];
+                var blockHeaders = plotHeaders.Where(h => GetPlotHeaders(bandRows).Contains(h, StringComparer.OrdinalIgnoreCase)).ToArray();
+                var plotSlots = new (string Header, byte[] FinalBytes, (int WidthEmu, int HeightEmu) Size)?[blockHeaders.Length];
 
-                Parallel.For(0, plotHeaders.Count, hIdx =>
+                Parallel.For(0, blockHeaders.Length, hIdx =>
                 {
-                    var header = plotHeaders[hIdx];
+                    var header = blockHeaders[hIdx];
                     var earfcns = bandRows.Select(x => x.Earfcn);
                     var mapRawBytes = TryResolveMapImage(
                         imageBytesByUrl,
@@ -3752,11 +3779,11 @@ namespace SignalTracker.Controllers
                 });
 
                 var plotsByHeader = new Dictionary<string, (string Header, byte[] FinalBytes, (int WidthEmu, int HeightEmu) Size)>(StringComparer.OrdinalIgnoreCase);
-                for (int hIdx = 0; hIdx < plotHeaders.Count; hIdx++)
+                for (int hIdx = 0; hIdx < blockHeaders.Length; hIdx++)
                 {
                     if (plotSlots[hIdx].HasValue)
                     {
-                        plotsByHeader[plotHeaders[hIdx].ToUpperInvariant()] = plotSlots[hIdx]!.Value;
+                        plotsByHeader[blockHeaders[hIdx].ToUpperInvariant()] = plotSlots[hIdx]!.Value;
                     }
                 }
 
@@ -3890,7 +3917,8 @@ namespace SignalTracker.Controllers
                 FreezeTopRow = false
             };
 
-            sheet.Rows.Add(XlsxRow.Title($"Walk Test Excel Report - {projectName}", 22));
+            var wifiOnly = rows.Count > 0 && rows.All(r => r.IsWifi);
+            sheet.Rows.Add(XlsxRow.Title($"{(wifiOnly ? "Wi-Fi Indoor" : "Walk Test")} Excel Report - {projectName}", 22));
             sheet.Rows.Add(XlsxRow.FromText("Generated On", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)));
             sheet.Rows.Add(XlsxRow.FromText("Band Sheets", string.Join(", ", rows.Select(x => x.BandSheetName).Distinct().OrderBy(x => x))));
             sheet.Rows.Add(XlsxRow.Blank());
@@ -3916,7 +3944,7 @@ namespace SignalTracker.Controllers
                 ("IBS Type (Full, Partial, Skeletal)", "XXX"),
                 ("Date of Installation", "XXX"),
                 ("Date of I&C", "XXX"),
-                ("eNode Band for Node B(900/1800/2100/2300/3500)", enodeBands),
+                (wifiOnly ? "Wi-Fi Band (GHz)" : "eNode Band for Node B(900/1800/2100/2300/3500)", enodeBands),
                 ("Max. Output Power", "XXX"),
                 ("Site Type", "XXX"),
                 ("DAS MIMO Configuration", "XXX"),
@@ -3988,7 +4016,8 @@ namespace SignalTracker.Controllers
             bool earfcnWise = true,
             IReadOnlyList<string>? plotHeaders = null)
         {
-            plotHeaders ??= ImageHeaders;
+            plotHeaders ??= GetPlotHeaders(bandRows);
+            plotHeaders = plotHeaders.Where(h => GetPlotHeaders(bandRows).Contains(h, StringComparer.OrdinalIgnoreCase)).ToArray();
             var columnWidths = new double[15];
             for (int c = 0; c < 15; c++)
                 columnWidths[c] = 13.5; // ~100 px per cell
@@ -4456,6 +4485,9 @@ namespace SignalTracker.Controllers
             bool filterByImageName = true)
         {
             var headerUpper = (header ?? "").ToUpperInvariant().Trim();
+            if (rows.Count > 0 && rows.All(r => r.IsWifi))
+                return CalculateWifiLegendStatistics(rows, headerUpper,
+                    rows.Select(r => r.WifiThresholds).FirstOrDefault(c => c != null) ?? thresholds, filterByImageName);
             var ranges = thresholds.GetRangesForHeader(headerUpper);
 
             var result = ranges.Select(r => new LegendStatRow { Range = r, Count = 0 }).ToList();
@@ -4863,6 +4895,10 @@ namespace SignalTracker.Controllers
         public sealed class ReportThresholdConfig
         {
             public string Source { get; set; } = "Hardcoded";
+            public List<ThresholdRange> WifiRssi { get; set; } = new();
+            public List<ThresholdRange> WifiLinkSpeed { get; set; } = new();
+            public List<ThresholdRange> WifiChannel { get; set; } = new();
+            public List<ThresholdRange> WifiBand { get; set; } = new();
             public List<ThresholdRange> Rsrp { get; set; } = new();
             public List<ThresholdRange> Rsrq { get; set; } = new();
             public List<ThresholdRange> Sinr { get; set; } = new();
@@ -4882,6 +4918,10 @@ namespace SignalTracker.Controllers
                 var h = (header ?? "").ToUpperInvariant().Trim();
                 return h switch
                 {
+                    "WIFI_RSSI" => WifiRssi,
+                    "LINK_SPEED" or "WIFI_LINK" => WifiLinkSpeed,
+                    "CHANNEL" or "WIFI_CHANNEL" => WifiChannel,
+                    "WIFI_BAND" => WifiBand,
                     "RSRP" => Rsrp,
                     "RSRQ" => Rsrq,
                     "SINR" => Sinr,
@@ -5028,6 +5068,9 @@ namespace SignalTracker.Controllers
                     if (TryGetPropertyIgnoreCase(doc.RootElement, "range", out var rangeRoot) &&
                         rangeRoot.ValueKind == System.Text.Json.JsonValueKind.Object)
                     {
+                        applied |= ApplyRangeMetric(rangeRoot, "WIFI_RSSI", ranges => config.WifiRssi = ranges);
+                        applied |= ApplyRangeMetric(rangeRoot, "WIFI_LINK", ranges => config.WifiLinkSpeed = ranges);
+                        applied |= ApplyRangeMetric(rangeRoot, "LINK_SPEED", ranges => config.WifiLinkSpeed = ranges);
                         applied |= ApplyRangeMetric(rangeRoot, "RSRP", ranges => config.Rsrp = ranges);
                         applied |= ApplyRangeMetric(rangeRoot, "RSRQ", ranges => config.Rsrq = ranges);
                         applied |= ApplyRangeMetric(rangeRoot, "SINR", ranges => config.Sinr = ranges);
@@ -5041,6 +5084,8 @@ namespace SignalTracker.Controllers
                     if (TryGetPropertyIgnoreCase(doc.RootElement, "value", out var valueRoot) &&
                         valueRoot.ValueKind == System.Text.Json.JsonValueKind.Object)
                     {
+                        applied |= ApplyValueMetric(valueRoot, "WIFI_CHANNEL", ranges => config.WifiChannel = ranges);
+                        applied |= ApplyValueMetric(valueRoot, "WIFI_BAND", ranges => config.WifiBand = ranges);
                         applied |= ApplyValueMetric(valueRoot, "BLER", ranges => config.Bler = ranges);
                         applied |= ApplyValueMetric(valueRoot, "LTE_BLER", ranges => config.Bler = ranges);
                         applied |= ApplyValueMetric(valueRoot, "VOLTE", ranges => config.VolteCall = ranges);
@@ -5438,6 +5483,8 @@ namespace SignalTracker.Controllers
                     var rangeDisplay = isEarfcn
                         ? (!string.IsNullOrWhiteSpace(stat.Range.Display) ? stat.Range.Display : (!string.IsNullOrWhiteSpace(stat.Range.Label) ? stat.Range.Label : stat.Range.RangeOnlyDisplay))
                         : stat.Range.RangeOnlyDisplay;
+                    if (header.Equals("BAND", StringComparison.OrdinalIgnoreCase) && allRows.Any(r => r.IsWifi)
+                        && !string.IsNullOrWhiteSpace(stat.Range.Label)) rangeDisplay = stat.Range.Label;
                     if (string.IsNullOrWhiteSpace(rangeDisplay)) rangeDisplay = stat.Range.Display;
 
                     string label = $"{rangeDisplay}  ({stat.Count} | {stat.Percentage:0.00}%)";
@@ -5543,6 +5590,9 @@ namespace SignalTracker.Controllers
             var h = (header ?? "").ToUpperInvariant().Trim();
             return h switch
             {
+                "WIFI_RSSI" => "Wi-Fi RSSI (dBm)",
+                "LINK_SPEED" => "Wi-Fi Link Speed (Mbps)",
+                "CHANNEL" => "Wi-Fi Channel",
                 "RSRP" => "RSRP (dBm)",
                 "RSRQ" => "RSRQ (dB)",
                 "SINR" => "SINR (dB)",
@@ -5797,6 +5847,13 @@ namespace SignalTracker.Controllers
             public float? Y { get; set; }
             public string? IndoorOutdoor { get; set; }
             public string? Network { get; set; }
+            public bool IsWifi { get; set; }
+            public float? WifiRssi { get; set; }
+            public float? WifiLinkSpeed { get; set; }
+            public string? WifiChannel { get; set; }
+            public string? WifiSsid { get; set; }
+            public string? WifiBssid { get; set; }
+            public ReportThresholdConfig? WifiThresholds { get; set; }
             public string? Provider { get; set; }
             public string? Band { get; set; }
             public string BandSheetName { get; set; } = "Unknown Band";

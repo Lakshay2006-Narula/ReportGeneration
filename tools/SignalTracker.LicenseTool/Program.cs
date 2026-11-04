@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
-using System.Reflection;
 using System.Text;
+using System.Text.Json;
 
 if (args.Length == 0)
 {
@@ -37,6 +37,9 @@ static int GenerateKeys(string[] args)
 {
     var outputDirectory = GetOption(args, "--out") ?? "license-keys";
     Directory.CreateDirectory(outputDirectory);
+    if (File.Exists(Path.Combine(outputDirectory, "private-key.txt")) ||
+        File.Exists(Path.Combine(outputDirectory, "public-key.txt")))
+        throw new IOException("Signing key files already exist. Choose a new output directory; existing keys will not be overwritten.");
 
     using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
     var privateKey = Convert.ToBase64String(ecdsa.ExportPkcs8PrivateKey());
@@ -58,8 +61,9 @@ static int IssueLicense(string[] args)
     var licensedTo = GetOption(args, "--name") ?? "S-Tracer User";
     var companyCode = RequireOption(args, "--company-code");
     var daysText = RequireOption(args, "--days");
-    var privateKeySource = GetOption(args, "--private-key") ?? "";
+    var privateKeySource = RequireOption(args, "--private-key");
     var outputPath = GetOption(args, "--out");
+    var features = ParseFeatures(RequireOption(args, "--features"));
 
     if (string.IsNullOrWhiteSpace(companyCode))
         return Fail("--company-code is required.");
@@ -67,7 +71,7 @@ static int IssueLicense(string[] args)
     if (!int.TryParse(daysText, out var days) || days <= 0)
         return Fail("--days must be a positive number.");
 
-    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource);
+    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource, features);
 
     if (!string.IsNullOrWhiteSpace(outputPath))
     {
@@ -89,19 +93,17 @@ static int InteractiveIssueLicense()
     Console.WriteLine("==========================");
     Console.WriteLine();
 
-    var defaultPrivateKeyPath = FindDefaultPrivateKeyPath();
     var machineId = PromptRequired("Machine ID");
     var licensedTo = Prompt("Customer/company name", "S-Tracer User");
     var companyCode = PromptRequired("Company code");
     var days = PromptPositiveInt("License duration in days", 365);
-    var privateKeySource = HasEmbeddedPrivateKey()
-        ? ""
-        : Prompt("Private key path", defaultPrivateKeyPath ?? Path.Combine(AppContext.BaseDirectory, "private-key.txt"));
+    var features = ParseFeatures(PromptRequired("Report features (cellular, wifi, or cellular,wifi)"));
+    var privateKeySource = PromptRequired("Private signing key file (internal use only)");
     var outputPath = Prompt(
         "Output file",
         Path.Combine(AppContext.BaseDirectory, $"license-{SanitizeFileName(machineId)}-{days}d.txt"));
 
-    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource);
+    var licenseKey = IssueLicenseCore(machineId, days, licensedTo, companyCode, privateKeySource, features);
     File.WriteAllText(outputPath, licenseKey);
 
     Console.WriteLine();
@@ -116,24 +118,34 @@ static int InteractiveIssueLicense()
     return 0;
 }
 
-static string IssueLicenseCore(string machineId, int days, string licensedTo, string companyCode, string privateKeySource)
+static string IssueLicenseCore(string machineId, int days, string licensedTo, string companyCode, string privateKeySource, string[] features)
 {
-    var privateKey = string.IsNullOrWhiteSpace(privateKeySource)
-        ? ReadEmbeddedPrivateKey()
-        : File.Exists(privateKeySource)
-        ? File.ReadAllText(privateKeySource).Trim()
-        : privateKeySource.Trim();
+    if (string.IsNullOrWhiteSpace(privateKeySource) || !File.Exists(privateKeySource))
+        throw new ArgumentException("A private signing key file is required. Use --private-key on a trusted internal machine.");
+    var privateKey = File.ReadAllText(privateKeySource).Trim();
 
     var issuedUtc = DateTimeOffset.UtcNow;
     var expiresUtc = issuedUtc.AddDays(days);
-    var payloadJson =
-        $"{{\"mid\":\"{EscapeJson(machineId.Trim())}\",\"name\":\"{EscapeJson(licensedTo.Trim())}\",\"cc\":\"{EscapeJson(companyCode.Trim())}\",\"iat\":\"{issuedUtc:O}\",\"exp\":\"{expiresUtc:O}\"}}";
+    var payloadJson = JsonSerializer.Serialize(new
+    {
+        mid = machineId.Trim(), name = licensedTo.Trim(), cc = companyCode.Trim(),
+        iat = issuedUtc.ToString("O"), exp = expiresUtc.ToString("O"), features
+    });
     var payloadBytes = Encoding.UTF8.GetBytes(payloadJson);
 
     using var ecdsa = ECDsa.Create();
     ecdsa.ImportPkcs8PrivateKey(Convert.FromBase64String(privateKey), out _);
     var signature = ecdsa.SignData(payloadBytes, HashAlgorithmName.SHA256);
     return $"{Base64UrlEncode(payloadBytes)}.{Base64UrlEncode(signature)}";
+}
+
+static string[] ParseFeatures(string input)
+{
+    var features = input.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+        .Select(f => f.ToLowerInvariant()).Distinct().ToArray();
+    if (features.Length == 0 || features.Any(f => f is not "cellular" and not "wifi"))
+        throw new ArgumentException("--features must be cellular, wifi, or cellular,wifi.");
+    return features;
 }
 
 static string? GetOption(string[] args, string name)
@@ -179,34 +191,6 @@ static int PromptPositiveInt(string label, int defaultValue)
     }
 }
 
-static string? FindDefaultPrivateKeyPath()
-{
-    var candidates = new[]
-    {
-        Path.Combine(AppContext.BaseDirectory, "private-key.txt"),
-        Path.Combine(AppContext.BaseDirectory, "license-keys", "private-key.txt"),
-        Path.Combine(Environment.CurrentDirectory, "private-key.txt"),
-        Path.Combine(Environment.CurrentDirectory, "license-keys", "private-key.txt")
-    };
-
-    return candidates.FirstOrDefault(File.Exists);
-}
-
-static bool HasEmbeddedPrivateKey()
-{
-    return Assembly.GetExecutingAssembly().GetManifestResourceNames().Contains("private-key.txt");
-}
-
-static string ReadEmbeddedPrivateKey()
-{
-    using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("private-key.txt");
-    if (stream == null)
-        throw new InvalidOperationException("No private key was embedded. Rebuild with license-keys/private-key.txt present or pass --private-key.");
-
-    using var reader = new StreamReader(stream, Encoding.UTF8);
-    return reader.ReadToEnd().Trim();
-}
-
 static string SanitizeFileName(string value)
 {
     var invalidChars = Path.GetInvalidFileNameChars();
@@ -217,47 +201,6 @@ static string SanitizeFileName(string value)
 static string Base64UrlEncode(byte[] bytes)
 {
     return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-}
-
-static string EscapeJson(string value)
-{
-    var builder = new StringBuilder(value.Length + 8);
-
-    foreach (var ch in value)
-    {
-        switch (ch)
-        {
-            case '\\':
-                builder.Append("\\\\");
-                break;
-            case '"':
-                builder.Append("\\\"");
-                break;
-            case '\b':
-                builder.Append("\\b");
-                break;
-            case '\f':
-                builder.Append("\\f");
-                break;
-            case '\n':
-                builder.Append("\\n");
-                break;
-            case '\r':
-                builder.Append("\\r");
-                break;
-            case '\t':
-                builder.Append("\\t");
-                break;
-            default:
-                if (char.IsControl(ch))
-                    builder.Append($"\\u{(int)ch:x4}");
-                else
-                    builder.Append(ch);
-                break;
-        }
-    }
-
-    return builder.ToString();
 }
 
 static int Fail(string message)
@@ -272,5 +215,5 @@ static void PrintUsage()
     Console.WriteLine("Usage:");
     Console.WriteLine("  STracerLicenseGenerator.exe");
     Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- genkeys --out license-keys");
-    Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- issue --machine XXXX-XXXX-XXXX-XXXX --company-code ABC --days 365 --name \"Customer\"");
+    Console.WriteLine("  dotnet run --project tools/SignalTracker.LicenseTool -- issue --machine XXXX-XXXX-XXXX-XXXX --company-code ABC --days 365 --features cellular,wifi --private-key PATH-TO-PRIVATE-KEY --name \"Customer\"");
 }

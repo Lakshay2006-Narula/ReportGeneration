@@ -2,6 +2,7 @@ namespace SignalTracker.Models
 {
     public sealed class RemoteLogReportRequest
     {
+        public string? CaptureType { get; set; }
         public string? JobId { get; set; }
         public long? CompanyId { get; set; }
         public long? UserId { get; set; }

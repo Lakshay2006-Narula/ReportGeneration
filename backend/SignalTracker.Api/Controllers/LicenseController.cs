@@ -30,6 +30,7 @@ namespace SignalTracker.Controllers
                 licensedTo = status.LicensedTo,
                 companyId = status.CompanyId,
                 companyCode = status.CompanyCode,
+                features = status.Features,
                 expiresUtc = status.ExpiresUtc,
                 error = status.Activated ? null : status.Error
             });
@@ -58,6 +59,7 @@ namespace SignalTracker.Controllers
                 licensedTo = status.LicensedTo,
                 companyId = status.CompanyId,
                 companyCode = status.CompanyCode,
+                features = status.Features,
                 expiresUtc = status.ExpiresUtc
             });
         }

@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using SignalTracker.Models;
+using SignalTracker.Licensing;
 
 namespace SignalTracker.Controllers
 {
@@ -12,8 +13,9 @@ namespace SignalTracker.Controllers
         public ExcelZipReportController(
             ApplicationDbContext db,
             IHttpClientFactory httpClientFactory,
-            IConfiguration configuration)
-            : base(db, httpClientFactory, configuration)
+            IConfiguration configuration,
+            LicenseService licenseService)
+            : base(db, httpClientFactory, configuration, licenseService)
         {
         }
     }
