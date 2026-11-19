@@ -9,6 +9,7 @@ namespace SignalTracker.Models
     {
         public string? CaptureType { get; set; }
         public string? JobId { get; set; }
+        public string? ClientEmail { get; set; }
         public IFormFile? LogZip { get; set; }
         public List<IFormFile>? LogZips { get; set; }
         public string? Title { get; set; }

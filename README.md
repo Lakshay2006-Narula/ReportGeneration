@@ -127,6 +127,10 @@ The frontend uses these report endpoints:
 
 During development the API listens on `127.0.0.1:5000`. Packaged desktop builds start the published backend on `127.0.0.1:48327`.
 
+## Report email and S3 storage
+
+Copy the root `.env.example` to `.env` and fill in the S3-compatible storage and SMTP values. The backend reads this root `.env` file; do not commit it. `AWS_S3_ENDPOINT` is required for Ace Cloud. Reports are uploaded under the `reports/` key prefix, which should match the prefix in the bucket's 185-day lifecycle rule. S3 does not require creating a physical folder: uploading a key beginning with `reports/` creates the prefix automatically. Email links are presigned download URLs and expire according to `S3_DOWNLOAD_URL_TTL_SECONDS`; expiring a link does not delete its object.
+
 ## Licensing
 
 The backend enforces an offline machine license when `License:Enforce` is enabled in `backend/SignalTracker.Api/appsettings.json`.

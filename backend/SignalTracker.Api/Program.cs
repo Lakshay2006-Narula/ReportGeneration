@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.RateLimiting;
 using SignalTracker.Licensing;
 using SignalTracker.Models;
 
+LoadRootEnvironmentFile();
 var builder = WebApplication.CreateBuilder(args);
 var dataDirectory = ResolveWritableDataDirectory();
 
@@ -105,6 +106,48 @@ app.MapControllers();
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
 
 app.Run();
+
+static void LoadRootEnvironmentFile()
+{
+    var searchRoots = new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory };
+    var envPath = searchRoots
+        .SelectMany(start => WalkParents(start))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Select(directory => Path.Combine(directory, ".env"))
+        .FirstOrDefault(File.Exists);
+
+    if (envPath == null)
+        return;
+
+    foreach (var rawLine in File.ReadLines(envPath))
+    {
+        var line = rawLine.Trim();
+        if (line.Length == 0 || line.StartsWith('#'))
+            continue;
+
+        var separator = line.IndexOf('=');
+        if (separator <= 0)
+            continue;
+
+        var key = line[..separator].Trim();
+        var value = line[(separator + 1)..].Trim();
+        if (value.Length >= 2 && ((value[0] == '"' && value[^1] == '"') || (value[0] == '\'' && value[^1] == '\'')))
+            value = value[1..^1];
+
+        if (!string.IsNullOrWhiteSpace(key) && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(key)))
+            Environment.SetEnvironmentVariable(key, value);
+    }
+}
+
+static IEnumerable<string> WalkParents(string start)
+{
+    var directory = new DirectoryInfo(start);
+    while (directory != null)
+    {
+        yield return directory.FullName;
+        directory = directory.Parent;
+    }
+}
 
 static string ResolveWritableDataDirectory()
 {

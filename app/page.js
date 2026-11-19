@@ -399,6 +399,7 @@ export default function Home() {
   const [remoteDownloadProgress, setRemoteDownloadProgress] = useState(null);
   const [downloadedRemoteFiles, setDownloadedRemoteFiles] = useState([]);
   const [reportTitle, setReportTitle] = useState("");
+  const [reportEmail, setReportEmail] = useState("");
   const [reportType, setReportType] = useState("excel");
   const [reportMode, setReportMode] = useState("separate");
   const [showSampleCount, setShowSampleCount] = useState(false);
@@ -704,6 +705,13 @@ export default function Home() {
       return;
     }
 
+    const recipientEmails = [...new Set(reportEmail.split(",").map((email) => email.trim()).filter(Boolean))];
+    if (recipientEmails.some((email) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+      setError("Enter valid email addresses separated by commas.");
+      return;
+    }
+    const recipientEmail = recipientEmails.join(", ");
+
     setGenerateLoading(true);
     setReportProgress({ progress: 3, stage: "Preparing report..." });
     setError("");
@@ -723,6 +731,7 @@ export default function Home() {
       filesForReport.forEach((file) => formData.append(reportOption.fileField, file));
       formData.append("Title", reportTitle || "");
       formData.append("ProjectName", reportTitle || "");
+      if (recipientEmail) formData.append("ClientEmail", recipientEmail);
       formData.append("FilterByImageName", "true");
       formData.append("CaptureType", captureType);
       formData.append("ShowSampleCount", String(showSampleCount));
@@ -783,7 +792,19 @@ export default function Home() {
         : getHeaderFileName(contentDisposition) || `${safeBaseName}_${safeBands}_report.${extension}`;
       const saved = await downloadBlob(blob, fileName);
       setReportProgress({ progress: 100, stage: saved ? "Report saved." : "Save cancelled." });
-      setMessage(saved ? `${reportOption.label} report saved.` : "Save cancelled.");
+      const deliveryError = progressData?.DeliveryError || progressData?.deliveryError;
+      const deliverySucceeded = progressData?.DeliverySucceeded ?? progressData?.deliverySucceeded;
+      if (!saved) {
+        setMessage("Save cancelled.");
+      } else if (recipientEmail && deliveryError) {
+        setMessage(`Report saved, but email delivery failed: ${deliveryError}`);
+      } else if (recipientEmail && deliverySucceeded === true) {
+        setMessage(`${reportOption.label} report saved and its link was emailed to ${recipientEmail}.`);
+      } else if (recipientEmail) {
+        setMessage("Report saved, but the backend did not confirm email delivery. Restart the backend and check its delivery settings.");
+      } else {
+        setMessage(`${reportOption.label} report saved.`);
+      }
     } catch (err) {
       setError(err?.message || "Failed to generate report.");
     } finally {
@@ -1010,6 +1031,24 @@ export default function Home() {
           </select>
         </label>
       </div>
+
+      <label className="field-label mt-4">
+        <span>Send report to email</span>
+        <input
+          className="field-input"
+          type="email"
+          multiple
+          autoComplete="email"
+          inputMode="email"
+          value={reportEmail}
+          onChange={(event) => setReportEmail(event.target.value)}
+          placeholder="client@example.com, another@example.com"
+          disabled={isReportBusy}
+        />
+        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+          Optional. Separate multiple email addresses with commas. Leave blank to generate the report without emailing it.
+        </span>
+      </label>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         {reportType === "excel" && (

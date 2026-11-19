@@ -95,17 +95,52 @@ namespace SignalTracker.Controllers
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IConfiguration _configuration;
         private readonly LicenseService _licenseService;
+        private readonly ReportDeliveryService _reportDeliveryService;
+        private readonly ILogger<ExcelReportController> _logger;
 
         public ExcelReportController(
             ApplicationDbContext db,
             IHttpClientFactory httpClientFactory,
             IConfiguration configuration,
-            LicenseService licenseService)
+            LicenseService licenseService,
+            ILogger<ExcelReportController> logger)
         {
             _db = db;
             _httpClientFactory = httpClientFactory;
             _configuration = configuration;
             _licenseService = licenseService;
+            _logger = logger;
+            _reportDeliveryService = new ReportDeliveryService(configuration, logger);
+        }
+
+        private async Task DeliverReportIfRequestedAsync(
+            string jobId,
+            byte[] bytes,
+            string fileName,
+            string? recipientEmail,
+            string projectName,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(recipientEmail))
+            {
+                ReportProgressTracker.SetDeliveryResult(jobId, succeeded: false, "No client email address reached the report delivery step.");
+                _logger.LogWarning("[ReportDelivery] Delivery skipped for job {JobId}: no client email address was provided.", jobId);
+                return;
+            }
+
+            try
+            {
+                await _reportDeliveryService.UploadAndEmailAsync(
+                    bytes, fileName, recipientEmail.Trim(), projectName, cancellationToken);
+                ReportProgressTracker.SetDeliveryResult(jobId, succeeded: true);
+                _logger.LogInformation("[ReportDelivery] S3 upload and email completed for job {JobId}.", jobId);
+            }
+            catch (Exception ex)
+            {
+                // Keep the generated report available through the existing API if delivery fails.
+                ReportProgressTracker.SetDeliveryResult(jobId, succeeded: false, ex.Message);
+                _logger.LogError(ex, "[ReportDelivery] Delivery failed for job {JobId}: {ErrorMessage}", jobId, ex.Message);
+            }
         }
 
 
@@ -206,6 +241,8 @@ namespace SignalTracker.Controllers
                 IsFailed = item.IsFailed,
                 IsProcessing = item.IsProcessing,
                 Error = item.Error,
+                DeliverySucceeded = item.DeliverySucceeded,
+                DeliveryError = item.DeliveryError,
                 FileName = item.FileName,
                 DownloadUrl = item.IsCompleted ? $"/api/ExcelReport/Download/{item.JobId}" : null,
                 CreatedAt = item.CreatedAt,
@@ -251,6 +288,8 @@ namespace SignalTracker.Controllers
                             IsFailed = item.IsFailed,
                             IsProcessing = item.IsProcessing,
                             Error = item.Error,
+                            DeliverySucceeded = item.DeliverySucceeded,
+                            DeliveryError = item.DeliveryError,
                             FileName = item.FileName,
                             DownloadUrl = item.IsCompleted ? $"/api/ExcelReport/Download/{item.JobId}" : null
                         });
@@ -378,6 +417,9 @@ namespace SignalTracker.Controllers
                 var bytes = SimpleXlsxWriter.Write(workbook);
                 var filename = $"Walk_Test_Report_{request.ProjectId}_{DateTime.Now:yyyy-MM-dd}.xlsx";
 
+                await DeliverReportIfRequestedAsync(
+                    jobId, bytes, filename, request.ClientEmail,
+                    project.project_name ?? $"Project {project.id}", HttpContext.RequestAborted);
                 ReportProgressTracker.Complete(jobId, filename, bytes: bytes);
                 return File(bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename);
             }
@@ -435,6 +477,7 @@ namespace SignalTracker.Controllers
             var reqCopy = new ZipReportUploadRequest
             {
                 JobId = jobId,
+                ClientEmail = request?.ClientEmail,
                 ProjectName = request?.ProjectName,
                 CaptureType = request?.CaptureType,
                 Title = request?.Title,
@@ -536,6 +579,7 @@ namespace SignalTracker.Controllers
             var reportRequest = new ZipReportUploadRequest
             {
                 JobId = jobId,
+                ClientEmail = request.ClientEmail,
                 CaptureType = request.CaptureType,
                 Title = request.Title,
                 ProjectName = string.IsNullOrWhiteSpace(request.ProjectName) ? request.Title : request.ProjectName,
@@ -850,6 +894,8 @@ namespace SignalTracker.Controllers
             var outFilePath = Path.Combine(Path.GetTempPath(), $"Report_{jobId}.xlsx");
             await System.IO.File.WriteAllBytesAsync(outFilePath, bytes);
 
+            await DeliverReportIfRequestedAsync(
+                jobId, bytes, filename, request.ClientEmail, projectName, CancellationToken.None);
             ReportProgressTracker.Complete(jobId, filename, downloadPath: outFilePath, bytes: bytes);
         }
 
@@ -1038,6 +1084,8 @@ namespace SignalTracker.Controllers
                 var primarySessionId = sessionIds.Count > 0 ? sessionIds[0] : 0;
                 var filename = $"Walk_Test_Report_Zip_{primarySessionId}_{DateTime.Now:yyyy-MM-dd}.xlsx";
 
+                await DeliverReportIfRequestedAsync(
+                    jobId, bytes, filename, request.ClientEmail, projectName, HttpContext.RequestAborted);
                 ReportProgressTracker.Complete(jobId, filename, bytes: bytes);
                 return File(bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename);
             }
@@ -5826,6 +5874,7 @@ namespace SignalTracker.Controllers
         public sealed class WalkTestExcelReportRequest
         {
             public string? JobId { get; set; }
+            public string? ClientEmail { get; set; }
             public int ProjectId { get; set; }
             public List<long>? SessionIds { get; set; }
             public string? Provider { get; set; }

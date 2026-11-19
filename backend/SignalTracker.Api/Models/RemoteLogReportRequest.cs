@@ -4,6 +4,7 @@ namespace SignalTracker.Models
     {
         public string? CaptureType { get; set; }
         public string? JobId { get; set; }
+        public string? ClientEmail { get; set; }
         public long? CompanyId { get; set; }
         public long? UserId { get; set; }
         public List<long>? LogIds { get; set; }

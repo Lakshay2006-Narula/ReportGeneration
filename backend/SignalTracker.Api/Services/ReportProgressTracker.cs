@@ -13,6 +13,8 @@ namespace SignalTracker.Services
         public bool IsProcessing => !IsCompleted && !IsFailed;
         public string[] RequiredFeatures { get; set; } = Array.Empty<string>();
         public string? Error { get; set; }
+        public string? DeliveryError { get; set; }
+        public bool? DeliverySucceeded { get; set; }
         public string? FileName { get; set; }
         public string? DownloadPath { get; set; }
         public byte[]? FileBytes { get; set; }
@@ -51,6 +53,14 @@ namespace SignalTracker.Services
             item.FileName = fileName;
             item.DownloadPath = downloadPath;
             item.FileBytes = bytes;
+            item.UpdatedAt = DateTime.UtcNow;
+        }
+
+        public static void SetDeliveryResult(string jobId, bool succeeded, string? error = null)
+        {
+            var item = Items.GetOrAdd(jobId, id => new ReportProgressItem { JobId = id });
+            item.DeliverySucceeded = succeeded;
+            item.DeliveryError = error;
             item.UpdatedAt = DateTime.UtcNow;
         }
 

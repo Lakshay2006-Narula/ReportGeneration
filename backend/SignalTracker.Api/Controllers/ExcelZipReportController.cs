@@ -14,8 +14,9 @@ namespace SignalTracker.Controllers
             ApplicationDbContext db,
             IHttpClientFactory httpClientFactory,
             IConfiguration configuration,
-            LicenseService licenseService)
-            : base(db, httpClientFactory, configuration, licenseService)
+            LicenseService licenseService,
+            ILogger<ExcelReportController> logger)
+            : base(db, httpClientFactory, configuration, licenseService, logger)
         {
         }
     }
