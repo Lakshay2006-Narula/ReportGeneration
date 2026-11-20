@@ -288,7 +288,8 @@ const getBlob = async (path) => {
 
 const getJson = async (path) => {
   const response = await requestWithTimeout(makeApiUrl(path), {
-    method: "GET"
+    method: "GET",
+    cache: "no-store"
   });
 
   if (!response.ok) {
@@ -431,7 +432,7 @@ export default function Home() {
     if (!query) return remoteSessions;
 
     return remoteSessions.filter((session) =>
-      [session.LogId ?? session.logId, session.UserId ?? session.userId, session.FileName ?? session.fileName]
+      [session.LogId ?? session.logId, session.UserId ?? session.userId, session.FileName ?? session.fileName, session.Notes ?? session.notes]
         .some((value) => String(value ?? "").toLowerCase().includes(query))
     );
   }, [remoteSessions, sessionSearch]);
@@ -631,7 +632,7 @@ export default function Home() {
       const sessions = [];
       const pageSize = 200;
       for (let page = 1; ; page += 1) {
-        const response = await getJson(`/api/RemoteSessions?captureType=${encodeURIComponent(targetType)}&page=${page}&pageSize=${pageSize}`);
+        const response = await getJson(`/api/RemoteSessions?captureType=${encodeURIComponent(targetType)}&page=${page}&pageSize=${pageSize}&_refresh=${Date.now()}`);
         if (fetchId !== remoteFetchId.current) return;
         const batch = Array.isArray(response?.sessions) ? response.sessions : response?.Sessions;
         if (!Array.isArray(batch)) throw new Error("Remote session response is invalid.");
@@ -1317,9 +1318,18 @@ export default function Home() {
           {visibleRemoteSessions.map((session) => {
             const logId = session.LogId ?? session.logId;
             const userId = session.UserId ?? session.userId;
+            const displayValue = (...values) => values.find((value) => value !== undefined && value !== null && value !== "") ?? "—";
+            const rawStartTime = displayValue(session.StartTime, session.startTime, session.Start_Time, session.start_time, session.SessionTime, session.sessionTime, session.Time, session.time);
+            const startParts = String(rawStartTime).match(/^(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})[ T](\d{1,2}:\d{2}(?::\d{2})?)/);
+            const rawDate = displayValue(session.Date, session.date, session.SessionDate, session.sessionDate);
+            const sessionDate = startParts ? startParts[1] : String(rawDate).replace(/\s+00:00:00$/, "");
+            const startTime = startParts ? startParts[2] : rawStartTime;
+            const endTime = displayValue(session.EndTime, session.endTime, session.End_Time, session.end_time);
+            const remark = displayValue(session.Notes, session.notes);
             return (
-              <label className="glass-check min-w-0" key={String(logId)}>
+              <label className="glass-check min-w-0 items-start" key={String(logId)}>
                 <input
+                  className="mt-1"
                   type="checkbox"
                   checked={Boolean(selectedRemoteLogIds[String(logId)])}
                   disabled={isReportBusy || workflowStep === "configure"}
@@ -1332,6 +1342,13 @@ export default function Home() {
                   <strong className="block truncate text-sm" title={`${captureLabel} session ${logId}`}>{captureLabel} {logId}</strong>
                   <span className="block truncate text-xs font-medium text-slate-500 dark:text-slate-400">
                     log_{logId}.zip{userId ? ` - User ${userId}` : ""}
+                  </span>
+                  <span className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-slate-600 dark:text-slate-300">
+                    <span>Start date: {sessionDate}</span>
+                    <span>Start time: {startTime}</span>
+                    <span>Session ID: {logId}</span>
+                    <span>End time: {endTime}</span>
+                    <span className="col-span-2 break-words">Session remark: {remark}</span>
                   </span>
                 </span>
               </label>

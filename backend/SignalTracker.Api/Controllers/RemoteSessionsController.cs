@@ -41,6 +41,7 @@ namespace SignalTracker.Controllers
 
         // GET /api/RemoteSessions
         [HttpGet]
+        [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
         public async Task<IActionResult> Get(
             [FromQuery] long? companyId,
             [FromQuery] long? userId,
@@ -114,6 +115,51 @@ namespace SignalTracker.Controllers
                 await using var connection = new MySqlConnection(connectionString);
                 await connection.OpenAsync(cancellationToken);
 
+                var availableColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                await using (var columnsCommand = new MySqlCommand(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_session';",
+                    connection))
+                await using (var columnsReader = await columnsCommand.ExecuteReaderAsync(cancellationToken))
+                {
+                    while (await columnsReader.ReadAsync(cancellationToken))
+                        availableColumns.Add(columnsReader.GetString(0));
+                }
+
+                var networkColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                await using (var networkColumnsCommand = new MySqlCommand(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_network_log';",
+                    connection))
+                await using (var networkColumnsReader = await networkColumnsCommand.ExecuteReaderAsync(cancellationToken))
+                {
+                    while (await networkColumnsReader.ReadAsync(cancellationToken))
+                        networkColumns.Add(networkColumnsReader.GetString(0));
+                }
+
+                static string OptionalColumn(HashSet<string> columns, string alias, params string[] candidates)
+                {
+                    var column = candidates.FirstOrDefault(columns.Contains);
+                    return column is null ? $"NULL AS `{alias}`" : $"s.`{column}` AS `{alias}`";
+                }
+
+                var dateSql = OptionalColumn(availableColumns, "session_date", "start_date", "session_date", "session_start_date", "startdate", "date");
+                var timeSql = OptionalColumn(availableColumns, "session_time", "start_time", "session_time", "session_start_time", "starttime", "time");
+                var endTimeSql = OptionalColumn(availableColumns, "end_time", "session_end_time", "session_end", "end_datetime", "ended_at", "endtime");
+                var notesSql = OptionalColumn(availableColumns, "notes", "notes");
+                var networkNotesColumn = new[] { "notes", "session_notes", "remark", "remarks" }.FirstOrDefault(networkColumns.Contains);
+                var networkNotesSql = networkNotesColumn is null ? "NULL AS `network_notes`" : $"MAX(NULLIF(TRIM(n.`{networkNotesColumn}`), '')) AS `network_notes`";
+                var dateExpression = dateSql.StartsWith("NULL", StringComparison.Ordinal)
+                    ? "DATE(nl.`first_timestamp`) AS `session_date`"
+                    : $"COALESCE({dateSql[..dateSql.LastIndexOf(" AS ", StringComparison.Ordinal)]}, DATE(nl.`first_timestamp`)) AS `session_date`";
+                var timeExpression = timeSql.StartsWith("NULL", StringComparison.Ordinal)
+                    ? "TIME(nl.`first_timestamp`) AS `session_time`"
+                    : $"COALESCE({timeSql[..timeSql.LastIndexOf(" AS ", StringComparison.Ordinal)]}, TIME(nl.`first_timestamp`)) AS `session_time`";
+                var endTimeExpression = endTimeSql.StartsWith("NULL", StringComparison.Ordinal)
+                    ? "TIME(nl.`last_timestamp`) AS `end_time`"
+                    : $"COALESCE({endTimeSql[..endTimeSql.LastIndexOf(" AS ", StringComparison.Ordinal)]}, TIME(nl.`last_timestamp`)) AS `end_time`";
+                var notesExpression = notesSql.StartsWith("NULL", StringComparison.Ordinal)
+                    ? "nl.`network_notes` AS `notes`"
+                    : $"COALESCE(NULLIF(TRIM({notesSql[..notesSql.LastIndexOf(" AS ", StringComparison.Ordinal)]}), ''), nl.`network_notes`) AS `notes`";
+
                 var userFilter = userId.HasValue ? " AND s.`user_id` = @userId" : "";
                 // Legacy Wi-Fi ZIP sessions can be marked as wifi before their plot rows are imported.
                 var captureFilter = selectedCapture == "wifi" ? $" AND {WifiDataSql}"
@@ -121,8 +167,15 @@ namespace SignalTracker.Controllers
                 // The live schema stores the image-plot flag on tbl_session.extra_json.
                 // Filter before pagination so only qualifying sessions are listed.
                 var sql = $"""
-                    SELECT s.`id`, s.`company_id`, s.`user_id`, {WifiDataSql} AS has_wifi_data
+                    SELECT s.`id`, s.`company_id`, s.`user_id`, {WifiDataSql} AS has_wifi_data,
+                           {dateExpression}, {timeExpression}, {endTimeExpression}, {notesExpression}
                     FROM `tbl_session` s
+                    LEFT JOIN (
+                        SELECT n.`session_id`, MIN(n.`timestamp`) AS `first_timestamp`,
+                               MAX(n.`timestamp`) AS `last_timestamp`, {networkNotesSql}
+                        FROM `tbl_network_log` n
+                        GROUP BY n.`session_id`
+                    ) nl ON nl.`session_id` = s.`id`
                     WHERE s.`company_id` = @companyId{userFilter}
                       AND CASE
                           WHEN JSON_VALID(s.`extra_json`) THEN
@@ -142,6 +195,11 @@ namespace SignalTracker.Controllers
                 await using var reader = await command.ExecuteReaderAsync(cancellationToken);
                 var companyIdOrdinal = reader.GetOrdinal("company_id");
                 var userIdOrdinal = reader.GetOrdinal("user_id");
+                static string? ReadOptional(MySqlDataReader dataReader, string name)
+                {
+                    var ordinal = dataReader.GetOrdinal(name);
+                    return dataReader.IsDBNull(ordinal) ? null : Convert.ToString(dataReader.GetValue(ordinal), CultureInfo.InvariantCulture);
+                }
                 while (await reader.ReadAsync(cancellationToken))
                 {
                     var logId = reader.GetInt64("id");
@@ -151,6 +209,10 @@ namespace SignalTracker.Controllers
                         CaptureType = reader.GetBoolean("has_wifi_data") ? "wifi" : "cellular",
                         CompanyId = reader.IsDBNull(companyIdOrdinal) ? null : reader.GetInt64(companyIdOrdinal),
                         UserId = reader.IsDBNull(userIdOrdinal) ? null : reader.GetInt64(userIdOrdinal),
+                        SessionDate = ReadOptional(reader, "session_date"),
+                        SessionTime = ReadOptional(reader, "session_time"),
+                        EndTime = ReadOptional(reader, "end_time"),
+                        Notes = ReadOptional(reader, "notes"),
                         FileName = $"log_{logId}.zip",
                         ZipUrl = urlTemplate.Replace(
                             "{logId}",
@@ -301,6 +363,10 @@ namespace SignalTracker.Controllers
             public required string CaptureType { get; init; }
             public long? CompanyId { get; init; }
             public long? UserId { get; init; }
+            public string? SessionDate { get; init; }
+            public string? SessionTime { get; init; }
+            public string? EndTime { get; init; }
+            public string? Notes { get; init; }
             public required string FileName { get; init; }
             public required string ZipUrl { get; init; }
         }
